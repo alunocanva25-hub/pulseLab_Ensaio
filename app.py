@@ -1,38 +1,13 @@
 # app.py
-# PulseLab v5 - Administração interna + detecção experimental de pulso LED
-# -----------------------------------------------------------------------------
-# O que esta versão entrega:
-# - Login interno com SQLite (sem depender de OIDC)
-# - Bootstrap do primeiro administrador dentro do próprio app
-# - Admin controla usuários no próprio app
-# - Cadastro, ativação/bloqueio, troca de senha, papéis
-# - Histórico e auditoria local
-# - Módulo de ensaio baseado na linha v4 aprovada
-# - "IA de detecção de pulso" EXPERIMENTAL:
-#   * análise óptica do LED vermelho
-#   * calibração OFF / ON
-#   * score do vermelho
-#   * confiança da leitura
-#
-# Limitação importante:
-# - esta versão NÃO faz contagem contínua em vídeo em tempo real.
-# - o modo "IA" aqui é assistido/experimental por captura de imagem.
-# - para detecção automática contínua de pulsos, a próxima etapa ideal é:
-#   streamlit-webrtc + OpenCV.
-# -----------------------------------------------------------------------------
-
 from __future__ import annotations
 
 import base64
 import hashlib
 import io
-import os
-import secrets
 import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -40,18 +15,13 @@ import qrcode
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="PulseLab v5", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="PulseLab v5.1", page_icon="⚡", layout="wide")
 
-APP_DIR = Path(".")
-DB_PATH = APP_DIR / "pulselab_v5.db"
+DB_PATH = Path("pulselab_v51.db")
 
-# =============================================================================
-# BANCO
-# =============================================================================
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +34,6 @@ def get_conn() -> sqlite3.Connection:
         updated_at TEXT NOT NULL
     )
     """)
-
     conn.execute("""
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,22 +43,61 @@ def get_conn() -> sqlite3.Connection:
         details TEXT
     )
     """)
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS app_config (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """)
-
     conn.commit()
     return conn
 
 CONN = get_conn()
 
-# =============================================================================
-# HELPERS
-# =============================================================================
+def init_state():
+    defaults = {
+        "auth_user": None,
+        "pulsos": 0,
+        "rodando": False,
+        "inicio": None,
+        "fim": None,
+        "resultado": None,
+        "historico_local": [],
+        "modo_interface": "Mobile",
+        "camera_habilitada": True,
+        "camera_mobile_fallback": False,
+        "mostrar_qrcode": False,
+        "tempo_automatico": True,
+        "alvo_pulsos_auto": 10,
+        "tempo_minimo_seg": 5,
+        "tempo_maximo_seg": 600,
+        "debounce_ms": 250,
+        "classe": "B (1%)",
+        "tolerancia": 1.30,
+        "captura_modo": "Manual",
+        "calibracao_aberta": False,
+        "calib_off": None,
+        "calib_on": None,
+        "mostrar_tabela_parametros": True,
+        "app_logo_bytes": None,
+        "app_logo_name": None,
+        "macro_mode": True,
+        "rear_camera_hint": True,
+        "ultima_foto_led_bytes": None,
+        "ultima_foto_led_nome": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+st.markdown("""
+<style>
+.block-container {padding-top: 0.9rem; padding-bottom: 2rem;}
+.big-live-box {border: 2px solid #d9d9d9; border-radius: 18px; padding: 1rem; background: #ffffff; margin-bottom: 1rem;}
+.live-title {font-size: 1.15rem; font-weight: 800; margin-bottom: 0.4rem;}
+div[data-testid="stMetric"] {background: #fff; border: 1px solid #e6e6e6; border-radius: 14px; padding: 0.55rem 0.7rem;}
+</style>
+""", unsafe_allow_html=True)
+
+CLASSES = {"A (2%)": 4.00, "B (1%)": 1.30, "C (0.5%)": 0.70, "D (0.2%)": 0.30}
+CONSTANTES = [0.1, 0.2, 0.5, 1.0, 1.25, 1.5, 2.0, 2.4, 3.6, 4.8, 5.4, 6.25, 7.2, 8.0, 9.6, 10.8, 21.6]
+
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -123,138 +131,33 @@ def verify_login(username: str, password: str):
 def create_user(username: str, full_name: str, password: str, role: str = "tecnico", is_active: bool = True):
     ts = now_str()
     CONN.execute(
-        """
-        INSERT INTO users (username, full_name, password_hash, role, is_active, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
+        "INSERT INTO users (username, full_name, password_hash, role, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (username.strip().lower(), full_name.strip(), sha256_text(password), role, 1 if is_active else 0, ts, ts),
     )
     CONN.commit()
 
 def update_user_status(username: str, is_active: bool):
-    CONN.execute(
-        "UPDATE users SET is_active=?, updated_at=? WHERE lower(username)=lower(?)",
-        (1 if is_active else 0, now_str(), username),
-    )
+    CONN.execute("UPDATE users SET is_active=?, updated_at=? WHERE lower(username)=lower(?)", (1 if is_active else 0, now_str(), username))
     CONN.commit()
 
 def update_user_role(username: str, role: str):
-    CONN.execute(
-        "UPDATE users SET role=?, updated_at=? WHERE lower(username)=lower(?)",
-        (role, now_str(), username),
-    )
+    CONN.execute("UPDATE users SET role=?, updated_at=? WHERE lower(username)=lower(?)", (role, now_str(), username))
     CONN.commit()
 
 def update_user_password(username: str, password: str):
-    CONN.execute(
-        "UPDATE users SET password_hash=?, updated_at=? WHERE lower(username)=lower(?)",
-        (sha256_text(password), now_str(), username),
-    )
+    CONN.execute("UPDATE users SET password_hash=?, updated_at=? WHERE lower(username)=lower(?)", (sha256_text(password), now_str(), username))
     CONN.commit()
 
 def list_users_df() -> pd.DataFrame:
-    rows = CONN.execute("""
-        SELECT id, username, full_name, role, is_active, created_at, updated_at
-        FROM users
-        ORDER BY role DESC, username ASC
-    """).fetchall()
+    rows = CONN.execute("SELECT id, username, full_name, role, is_active, created_at, updated_at FROM users ORDER BY role DESC, username ASC").fetchall()
     if not rows:
         return pd.DataFrame(columns=["id", "username", "full_name", "role", "is_active", "created_at", "updated_at"])
     return pd.DataFrame([dict(r) for r in rows])
 
-def get_config(key: str, default: str = "") -> str:
-    row = CONN.execute("SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
-    return default if row is None else str(row["value"] or "")
-
-def set_config(key: str, value: str):
-    CONN.execute("""
-        INSERT INTO app_config(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (key, value))
-    CONN.commit()
-
-# =============================================================================
-# ESTADO
-# =============================================================================
-def init_state():
-    defaults = {
-        "auth_user": None,
-        "page": "Ensaio",
-        "pulsos": 0,
-        "rodando": False,
-        "inicio": None,
-        "fim": None,
-        "resultado": None,
-        "historico_local": [],
-        "modo_interface": "Mobile",
-        "camera_habilitada": True,
-        "mostrar_qrcode": False,
-        "tempo_automatico": True,
-        "alvo_pulsos_auto": 10,
-        "tempo_minimo_seg": 5,
-        "tempo_maximo_seg": 600,
-        "debounce_ms": 250,
-        "classe": "B (1%)",
-        "tolerancia": 1.30,
-        "captura_modo": "Manual",
-        "calibracao_aberta": False,
-        "calib_off": None,
-        "calib_on": None,
-        "mostrar_tabela_parametros": True,
-        "app_logo_bytes": None,
-        "app_logo_name": None,
-        "admin_new_pwd": "",
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-init_state()
-
-# =============================================================================
-# UI HELPERS
-# =============================================================================
-st.markdown("""
-<style>
-.block-container {padding-top: 1rem; padding-bottom: 2rem;}
-div[data-testid="stMetric"] {
-    background: #fff;
-    border: 1px solid #e6e6e6;
-    border-radius: 14px;
-    padding: 0.5rem 0.7rem;
-}
-.big-live-box {
-    border: 2px solid #d9d9d9;
-    border-radius: 18px;
-    padding: 1rem;
-    background: #ffffff;
-    margin-bottom: 1rem;
-}
-.live-title {
-    font-size: 1.2rem;
-    font-weight: 700;
-    margin-bottom: 0.4rem;
-}
-.card-soft {
-    background: #fff;
-    border: 1px solid #e9e9e9;
-    border-radius: 16px;
-    padding: 1rem;
-}
-</style>
-""", unsafe_allow_html=True)
-
-CLASSES = {
-    "A (2%)": 4.00,
-    "B (1%)": 1.30,
-    "C (0.5%)": 0.70,
-    "D (0.2%)": 0.30,
-}
-CONSTANTES = [0.1, 0.2, 0.5, 1.0, 1.25, 1.5, 2.0, 2.4, 3.6, 4.8, 5.4, 6.25, 7.2, 8.0, 9.6, 10.8, 21.6]
-
-def set_page(page: str):
-    st.session_state.page = page
-    st.rerun()
+def salvar_logo(uploaded_file):
+    if uploaded_file is not None:
+        st.session_state.app_logo_bytes = uploaded_file.getvalue()
+        st.session_state.app_logo_name = uploaded_file.name
 
 def get_local_ip():
     import socket
@@ -274,32 +177,23 @@ def render_qrcode(porta: int = 8501):
     qr.add_data(url)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    st.image(buf, width=220)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    st.image(buffer, width=220)
     st.code(url, language=None)
+    st.caption("Abra no celular na mesma rede Wi‑Fi. Em HTTPS a câmera tende a funcionar melhor.")
 
-def salvar_logo(uploaded_file):
-    if uploaded_file is not None:
-        st.session_state.app_logo_bytes = uploaded_file.getvalue()
-        st.session_state.app_logo_name = uploaded_file.name
-
-# =============================================================================
-# AUTH - BOOTSTRAP
-# =============================================================================
 def bootstrap_first_admin():
-    st.title("⚡ PulseLab v5")
+    st.title("⚡ PulseLab v5.1")
     st.subheader("Primeiro acesso - criar administrador master")
     st.info("Como ainda não existe usuário, crie agora o administrador principal do sistema.")
-
     with st.form("bootstrap_admin_form"):
-        username = st.text_input("Usuário admin", placeholder="admin ou seu email")
+        username = st.text_input("Usuário admin", placeholder="admin")
         full_name = st.text_input("Nome completo")
         password = st.text_input("Senha", type="password")
         password2 = st.text_input("Confirmar senha", type="password")
         submitted = st.form_submit_button("Criar administrador")
-
     if submitted:
         username = username.strip().lower()
         if not username or not full_name.strip() or not password:
@@ -311,51 +205,39 @@ def bootstrap_first_admin():
         try:
             create_user(username, full_name.strip(), password, role="admin", is_active=True)
             log_event(username, "bootstrap_admin", f"Administrador master criado: {username}")
-            st.success("Administrador criado com sucesso. Faça login abaixo.")
+            st.success("Administrador criado com sucesso. Faça login.")
             time.sleep(1)
             st.rerun()
         except sqlite3.IntegrityError:
             st.error("Esse usuário já existe.")
-
     st.stop()
 
 def login_screen():
-    st.title("🔒 PulseLab v5")
+    st.title("🔒 PulseLab v5.1")
     st.subheader("Login interno")
-    st.caption("Administração interna de usuários + detecção experimental de pulso LED")
-
+    st.caption("Administração interna + modo campo + IA LED experimental")
     with st.form("login_form"):
         username = st.text_input("Usuário")
         password = st.text_input("Senha", type="password")
         login_submitted = st.form_submit_button("Entrar")
-
     if login_submitted:
         row = verify_login(username.strip().lower(), password)
         if row is None:
             st.error("Usuário, senha ou status inválido.")
         else:
-            st.session_state.auth_user = {
-                "username": row["username"],
-                "full_name": row["full_name"],
-                "role": row["role"],
-            }
+            st.session_state.auth_user = {"username": row["username"], "full_name": row["full_name"], "role": row["role"]}
             log_event(row["username"], "login", "Login efetuado")
             st.rerun()
-
     st.stop()
 
 if count_users() == 0:
     bootstrap_first_admin()
-
 if st.session_state.auth_user is None:
     login_screen()
 
 AUTH = st.session_state.auth_user
 IS_ADMIN = AUTH["role"] == "admin"
 
-# =============================================================================
-# ENSAIO HELPERS
-# =============================================================================
 def reset_ensaio():
     st.session_state.pulsos = 0
     st.session_state.rodando = False
@@ -423,30 +305,65 @@ def tabela_parametros(potencia, constante, tempo_pulso, tempo_sug, meta_pulsos):
         {"Campo": "Debounce (ms)", "Valor": int(st.session_state.debounce_ms)},
     ])
 
-# =============================================================================
-# IA EXPERIMENTAL LED
-# =============================================================================
-def analyze_led_image(uploaded_file):
-    if uploaded_file is None:
+def salvar_foto_led(uploaded_file):
+    if uploaded_file is not None:
+        st.session_state.ultima_foto_led_bytes = uploaded_file.getvalue()
+        st.session_state.ultima_foto_led_nome = getattr(uploaded_file, "name", "imagem_led")
+
+def obter_foto_led(widget_key: str):
+    if not st.session_state.camera_habilitada:
+        return None
+    if st.session_state.camera_mobile_fallback and st.session_state.modo_interface == "Mobile":
+        up = st.file_uploader(
+            "Capturar/selecionar imagem do LED",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"{widget_key}_uploader",
+            help="Fallback para celular quando a câmera do navegador não abrir."
+        )
+        salvar_foto_led(up)
+        if st.session_state.ultima_foto_led_bytes:
+            return io.BytesIO(st.session_state.ultima_foto_led_bytes)
+        return None
+    cam = st.camera_input(
+        "Capturar LED",
+        key=widget_key,
+        help="Em celular, tente manter a câmera traseira e aproximar em modo macro quando disponível no aparelho."
+    )
+    salvar_foto_led(cam)
+    if st.session_state.ultima_foto_led_bytes:
+        return io.BytesIO(st.session_state.ultima_foto_led_bytes)
+    return None
+
+def analyze_led_image(file_like):
+    if file_like is None:
         return None, None, None
-
-    img = Image.open(uploaded_file).convert("RGB")
+    img = Image.open(file_like).convert("RGB")
     arr = np.array(img)
-
+    if st.session_state.macro_mode:
+        h, w = arr.shape[:2]
+        x1, x2 = int(w * 0.2), int(w * 0.8)
+        y1, y2 = int(h * 0.2), int(h * 0.8)
+        arr_crop = arr[y1:y2, x1:x2]
+        if arr_crop.size > 0:
+            arr = arr_crop
     r = float(arr[:, :, 0].mean())
     g = float(arr[:, :, 1].mean())
     b = float(arr[:, :, 2].mean())
     red_score = r - ((g + b) / 2.0)
-
+    guidance = "Captura boa"
     if st.session_state.calib_off is not None and st.session_state.calib_on is not None:
         threshold = (st.session_state.calib_off + st.session_state.calib_on) / 2.0
         status = "LED LIGADO" if red_score >= threshold else "LED DESLIGADO"
         distance = abs(red_score - threshold)
         confidence = min(99.0, max(40.0, 40.0 + distance))
+        if confidence < 60:
+            guidance = "Baixa confiança - aproxime a câmera ou recalibre"
+        elif confidence < 75:
+            guidance = "Captura razoável - tente estabilizar mais"
     else:
         status = "LED LIGADO" if red_score > 20 else "LED DESLIGADO"
         confidence = 55.0 if abs(red_score - 20) < 10 else 78.0
-
+        guidance = "Calibre OFF e ON para melhorar a confiança"
     df = pd.DataFrame([
         {"Métrica": "R médio", "Valor": round(r, 2)},
         {"Métrica": "G médio", "Valor": round(g, 2)},
@@ -454,29 +371,23 @@ def analyze_led_image(uploaded_file):
         {"Métrica": "Red Score", "Valor": round(red_score, 2)},
         {"Métrica": "Status óptico", "Valor": status},
         {"Métrica": "Confiança (%)", "Valor": round(confidence, 1)},
+        {"Métrica": "Macro/zoom digital", "Valor": "Ativo" if st.session_state.macro_mode else "Desligado"},
         {"Métrica": "Calibração OFF", "Valor": st.session_state.calib_off},
         {"Métrica": "Calibração ON", "Valor": st.session_state.calib_on},
+        {"Métrica": "Orientação", "Valor": guidance},
     ])
     return img, df, red_score
 
-# =============================================================================
-# TOPO
-# =============================================================================
-left, mid, right = st.columns([3, 1.3, 1.2])
+left, mid, right = st.columns([3, 1.5, 1.1])
 with left:
     if st.session_state.app_logo_bytes:
         b64 = base64.b64encode(st.session_state.app_logo_bytes).decode("utf-8")
-        st.markdown(
-            f'<div style="display:flex;align-items:center;gap:12px;"><img src="data:image/png;base64,{b64}" style="height:48px;border-radius:8px;"><h1 style="margin:0;">PulseLab v5</h1></div>',
-            unsafe_allow_html=True
-        )
+        st.markdown(f'<div style="display:flex;align-items:center;gap:12px;"><img src="data:image/png;base64,{b64}" style="height:48px;border-radius:8px;"><h1 style="margin:0;">PulseLab v5.1</h1></div>', unsafe_allow_html=True)
     else:
-        st.title("⚡ PulseLab v5")
-
+        st.title("⚡ PulseLab v5.1")
 with mid:
     st.write(f"**Usuário:** {AUTH['full_name']}")
     st.caption(f"{AUTH['username']} • {AUTH['role']}")
-
 with right:
     if st.button("Sair", use_container_width=True):
         log_event(AUTH["username"], "logout", "Logout manual")
@@ -486,12 +397,8 @@ with right:
 menu_options = ["Ensaio", "Histórico", "Configurações"]
 if IS_ADMIN:
     menu_options.append("Admin")
-
 selected = st.radio("Menu", menu_options, horizontal=True, label_visibility="collapsed")
 
-# =============================================================================
-# ENSAIO
-# =============================================================================
 if selected == "Ensaio":
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -510,10 +417,7 @@ if selected == "Ensaio":
     with a2:
         constante = st.selectbox("Constante Kh/Kd (Wh/pulso)", CONSTANTES, index=CONSTANTES.index(3.6))
     with a3:
-        st.session_state.captura_modo = st.selectbox(
-            "Modo de captura",
-            ["Manual", "IA LED Vermelho (experimental)", "Tarja Eletromecânico (futuro)"],
-        )
+        st.session_state.captura_modo = st.selectbox("Modo de captura", ["Manual", "IA LED Vermelho (experimental)", "Tarja Eletromecânico (futuro)"])
 
     potencia = calcular_potencia(tensao, corrente, fp)
     t_pulso = tempo_por_pulso_seg(potencia, constante)
@@ -538,13 +442,8 @@ if selected == "Ensaio":
                 st.rerun()
         with p2:
             st.caption("A tabela ajuda na conferência do ensaio, mas pode ser ocultada para deixar a tela mais limpa.")
-
         if st.session_state.mostrar_tabela_parametros:
-            st.dataframe(
-                tabela_parametros(potencia, constante, t_pulso, t_sug, meta_pulsos),
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(tabela_parametros(potencia, constante, t_pulso, t_sug, meta_pulsos), use_container_width=True, hide_index=True)
 
     if int(meta_pulsos) < 5:
         st.warning("Meta de pulsos muito baixa. Para um ensaio mais robusto, prefira pelo menos 5 pulsos.")
@@ -552,37 +451,21 @@ if selected == "Ensaio":
         st.success("Meta de pulsos boa para teste operacional mais consistente.")
 
     if st.session_state.captura_modo == "IA LED Vermelho (experimental)":
-        if st.session_state.rodando:
-            st.markdown('<div class="big-live-box">', unsafe_allow_html=True)
-            st.markdown('<div class="live-title">🔴 IA LED - captura assistida</div>', unsafe_allow_html=True)
-            st.caption(
-                "Nesta v5, a IA é experimental por captura. "
-                "Ela indica estado do LED e confiança, mas não faz contagem contínua automática ainda."
-            )
-            live_file = st.camera_input("Captura atual do LED", key="camera_led_live")
-            img, metrics_df, _ = analyze_led_image(live_file)
-            if img is not None:
-                st.image(img, caption="Captura atual", use_container_width=True)
-                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Aguardando captura do LED.")
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
+        if not st.session_state.rodando:
             b1, b2 = st.columns([1, 3])
             with b1:
                 if st.button("🎯 Calibração IA LED", use_container_width=True):
                     st.session_state.calibracao_aberta = not st.session_state.calibracao_aberta
                     st.rerun()
             with b2:
-                st.info(f"Calibração: {'ativa' if st.session_state.calibracao_aberta else 'oculta'}")
-
+                st.info(f"Calibração: {'ativa' if st.session_state.calibracao_aberta else 'oculta'} | traseira padrão: {'sim' if st.session_state.rear_camera_hint else 'não'} | macro/zoom: {'ativo' if st.session_state.macro_mode else 'desligado'}")
             if st.session_state.calibracao_aberta:
-                calib_file = st.camera_input("Capturar referência do LED", key="camera_led_calib")
+                st.caption("Para o LED: use a câmera traseira do celular e aproxime ao máximo, como macro.")
+                calib_file = obter_foto_led("camera_led_calib")
                 img, metrics_df, red_score = analyze_led_image(calib_file)
                 if img is not None:
                     st.image(img, caption="Imagem para análise", use_container_width=True)
                     st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-
                     ccal1, ccal2, ccal3 = st.columns(3)
                     with ccal1:
                         if st.button("Salvar OFF", use_container_width=True):
@@ -597,9 +480,20 @@ if selected == "Ensaio":
                             st.session_state.calib_off = None
                             st.session_state.calib_on = None
                             st.success("Calibração limpa.")
+        else:
+            st.markdown('<div class="big-live-box">', unsafe_allow_html=True)
+            st.markdown('<div class="live-title">🔴 IA LED - modo campo</div>', unsafe_allow_html=True)
+            st.caption("Durante o ensaio, a área do LED fica em destaque. Use a câmera traseira e aproxime o LED o máximo possível.")
+            live_file = obter_foto_led("camera_led_live")
+            img, metrics_df, _ = analyze_led_image(live_file)
+            if img is not None:
+                st.image(img, caption="Captura atual do LED", use_container_width=True)
+                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Aguardando captura do LED.")
+            st.markdown('</div>', unsafe_allow_html=True)
 
     st.subheader("Execução do ensaio")
-
     if st.session_state.modo_interface == "Mobile":
         b1, b2, b3 = st.columns(3)
     else:
@@ -614,7 +508,6 @@ if selected == "Ensaio":
                 erro = calcular_erro(e_medida, e_teorica)
                 robustez = classificar_robustez(int(meta_pulsos), int(st.session_state.pulsos), float(tempo_real))
                 status = "APROVADO" if abs(erro) <= float(st.session_state.tolerancia) else "REPROVADO"
-
                 st.session_state.resultado = {
                     "datahora": now_str(),
                     "usuario": AUTH["username"],
@@ -649,7 +542,6 @@ if selected == "Ensaio":
         if st.button("+", use_container_width=True):
             registrar_pulso()
             st.rerun()
-
     with b3:
         if st.button("-", use_container_width=True):
             remover_pulso()
@@ -661,23 +553,19 @@ if selected == "Ensaio":
         energia_medida = energia_medida_wh(st.session_state.pulsos, constante)
         erro = calcular_erro(energia_medida, energia_teorica)
         robustez = classificar_robustez(int(meta_pulsos), int(st.session_state.pulsos), float(tempo_decorrido))
-
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Pulsos", st.session_state.pulsos)
         k2.metric("Tempo (s)", round(tempo_decorrido, 2))
         k3.metric("Energia teórica", round(energia_teorica, 4))
         k4.metric("Erro (%)", round(erro, 4))
         k5.metric("Robustez", robustez)
-
         progresso = min(tempo_decorrido / max(float(tempo_ensaio), 1.0), 1.0)
         restante = max(float(tempo_ensaio) - tempo_decorrido, 0.0)
         st.progress(progresso)
         st.caption(f"Tempo configurado: {round(float(tempo_ensaio),2)} s | Restante: {round(restante,2)} s")
-
         if st.button("🔄 Resetar ensaio", use_container_width=True):
             reset_ensaio()
             st.rerun()
-
         if progresso < 1.0:
             time.sleep(1)
             st.rerun()
@@ -700,42 +588,32 @@ if selected == "Ensaio":
             else:
                 st.error("❌ REPROVADO")
 
-# =============================================================================
-# HISTÓRICO
-# =============================================================================
 elif selected == "Histórico":
-    st.subheader("Histórico local da sessão / app")
+    st.subheader("Histórico local")
     if not st.session_state.historico_local:
-        st.info("Ainda não há ensaios registrados nesta base.")
+        st.info("Ainda não há ensaios registrados.")
     else:
         for i, item in enumerate(st.session_state.historico_local):
             titulo = f"{item['datahora']} | {item['status']} | erro {item['erro']}%"
             with st.expander(titulo, expanded=(i == 0)):
                 st.dataframe(pd.DataFrame([{"Campo": k, "Valor": v} for k, v in item.items()]), use_container_width=True, hide_index=True)
 
-# =============================================================================
-# CONFIG
-# =============================================================================
 elif selected == "Configurações":
     st.subheader("Configurações do app")
-    st.session_state.modo_interface = st.radio(
-        "Modo de interface",
-        ["Desktop", "Mobile"],
-        index=0 if st.session_state.modo_interface == "Desktop" else 1,
-        horizontal=True,
-    )
+    st.session_state.modo_interface = st.radio("Modo de interface", ["Desktop", "Mobile"], index=0 if st.session_state.modo_interface == "Desktop" else 1, horizontal=True)
     st.session_state.camera_habilitada = st.toggle("Habilitar câmera no ensaio", value=st.session_state.camera_habilitada)
+    st.session_state.camera_mobile_fallback = st.toggle("Usar fallback de câmera no celular", value=st.session_state.camera_mobile_fallback, help="Quando a câmera do navegador não abrir no celular, usa seletor de imagem.")
+    st.session_state.rear_camera_hint = st.toggle("Priorizar câmera traseira (orientação de uso)", value=st.session_state.rear_camera_hint)
+    st.session_state.macro_mode = st.toggle("Modo macro/zoom digital LED", value=st.session_state.macro_mode, help="Aplica recorte digital central para aproximar a análise do LED.")
     st.session_state.tempo_automatico = st.toggle("Usar tempo automático por padrão", value=st.session_state.tempo_automatico)
     st.session_state.alvo_pulsos_auto = st.number_input("Pulsos alvo do tempo automático", min_value=1, max_value=100, value=int(st.session_state.alvo_pulsos_auto), step=1)
     st.session_state.tempo_minimo_seg = st.number_input("Tempo mínimo do ensaio (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_minimo_seg), step=1)
     st.session_state.tempo_maximo_seg = st.number_input("Tempo máximo do ensaio (s)", min_value=5, max_value=7200, value=int(st.session_state.tempo_maximo_seg), step=1)
     st.session_state.debounce_ms = st.number_input("Debounce entre pulsos (ms)", min_value=50, max_value=5000, value=int(st.session_state.debounce_ms), step=10)
-
     st.markdown("### QR Code")
     st.session_state.mostrar_qrcode = st.toggle("Mostrar QR Code de acesso", value=st.session_state.mostrar_qrcode)
     if st.session_state.mostrar_qrcode:
         render_qrcode(8501)
-
     st.markdown("### Imagem / Logo do app")
     up_logo = st.file_uploader("Adicionar imagem do app", type=["png", "jpg", "jpeg", "webp"])
     if up_logo is not None:
@@ -743,18 +621,14 @@ elif selected == "Configurações":
         st.success("Imagem do app atualizada.")
     if st.session_state.app_logo_bytes:
         st.image(st.session_state.app_logo_bytes, width=140)
+    st.info("Nesta versão, a câmera traseira e o macro são tratados como fluxo orientado de campo. O controle total da lente depende do navegador/dispositivo.")
 
-# =============================================================================
-# ADMIN
-# =============================================================================
 elif selected == "Admin":
-    st.subheader("Painel administrativo")
     if not IS_ADMIN:
         st.error("Acesso restrito.")
         st.stop()
-
+    st.subheader("Painel administrativo")
     tab1, tab2, tab3 = st.tabs(["Usuários", "Auditoria", "Minha senha"])
-
     with tab1:
         st.markdown("### Cadastro interno de usuários")
         with st.form("create_user_form"):
@@ -764,7 +638,6 @@ elif selected == "Admin":
             new_role = st.selectbox("Papel", ["tecnico", "admin"])
             new_active = st.toggle("Ativo", value=True)
             save_user = st.form_submit_button("Criar usuário")
-
         if save_user:
             try:
                 if not new_username.strip() or not new_full_name.strip() or not new_password:
@@ -773,19 +646,17 @@ elif selected == "Admin":
                     create_user(new_username.strip().lower(), new_full_name.strip(), new_password, new_role, new_active)
                     log_event(AUTH["username"], "create_user", f"user={new_username.strip().lower()}; role={new_role}; active={new_active}")
                     st.success("Usuário criado com sucesso.")
+                    st.rerun()
             except sqlite3.IntegrityError:
                 st.error("Esse usuário já existe.")
-
         st.markdown("### Lista de usuários")
         users_df = list_users_df()
         st.dataframe(users_df, use_container_width=True, hide_index=True)
-
         st.markdown("### Alterar usuário existente")
         usernames = [str(x) for x in users_df["username"].tolist()] if not users_df.empty else []
         if usernames:
             sel_user = st.selectbox("Selecionar usuário", usernames)
             user_row = get_user_by_username(sel_user)
-
             colu1, colu2, colu3 = st.columns(3)
             with colu1:
                 status_now = bool(user_row["is_active"])
@@ -795,16 +666,15 @@ elif selected == "Admin":
                     log_event(AUTH["username"], "update_user_status", f"user={sel_user}; active={new_status}")
                     st.success("Status atualizado.")
                     st.rerun()
-
             with colu2:
                 role_now = str(user_row["role"])
-                new_user_role = st.selectbox("Papel", ["tecnico", "admin"], index=0 if role_now == "tecnico" else 1, key="admin_role_select")
+                role_idx = 0 if role_now == "tecnico" else 1
+                new_user_role = st.selectbox("Papel", ["tecnico", "admin"], index=role_idx, key="admin_role_select")
                 if st.button("Salvar papel", use_container_width=True):
                     update_user_role(sel_user, new_user_role)
                     log_event(AUTH["username"], "update_user_role", f"user={sel_user}; role={new_user_role}")
                     st.success("Papel atualizado.")
                     st.rerun()
-
             with colu3:
                 new_pwd = st.text_input("Nova senha", type="password")
                 if st.button("Resetar senha", use_container_width=True):
@@ -817,17 +687,13 @@ elif selected == "Admin":
                         st.rerun()
         else:
             st.info("Nenhum usuário cadastrado além do admin inicial.")
-
     with tab2:
         st.markdown("### Auditoria do sistema")
-        rows = CONN.execute(
-            "SELECT ts, actor_username, event_type, details FROM audit_log ORDER BY id DESC LIMIT 500"
-        ).fetchall()
+        rows = CONN.execute("SELECT ts, actor_username, event_type, details FROM audit_log ORDER BY id DESC LIMIT 500").fetchall()
         if rows:
             st.dataframe(pd.DataFrame([dict(r) for r in rows]), use_container_width=True, hide_index=True)
         else:
             st.info("Sem eventos auditados ainda.")
-
     with tab3:
         st.markdown("### Alterar minha senha")
         with st.form("my_password_form"):
@@ -835,7 +701,6 @@ elif selected == "Admin":
             new_pwd1 = st.text_input("Nova senha", type="password")
             new_pwd2 = st.text_input("Confirmar nova senha", type="password")
             save_my_pwd = st.form_submit_button("Salvar nova senha")
-
         if save_my_pwd:
             user_row = verify_login(AUTH["username"], current_pwd)
             if user_row is None:
