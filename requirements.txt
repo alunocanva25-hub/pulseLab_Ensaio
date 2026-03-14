@@ -3,3 +3,6 @@ numpy
 pandas
 pillow
 qrcode
+streamlit-webrtc
+av
+opencv-python-headless
