@@ -1,0 +1,5 @@
+streamlit[auth]
+numpy
+pandas
+pillow
+qrcode
