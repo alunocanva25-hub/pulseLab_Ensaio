@@ -1,241 +1,194 @@
 # app.py
-# PulseLab v4 aprovado + camada de segurança
+# PulseLab v5 - Administração interna + detecção experimental de pulso LED
+# -----------------------------------------------------------------------------
+# O que esta versão entrega:
+# - Login interno com SQLite (sem depender de OIDC)
+# - Bootstrap do primeiro administrador dentro do próprio app
+# - Admin controla usuários no próprio app
+# - Cadastro, ativação/bloqueio, troca de senha, papéis
+# - Histórico e auditoria local
+# - Módulo de ensaio baseado na linha v4 aprovada
+# - "IA de detecção de pulso" EXPERIMENTAL:
+#   * análise óptica do LED vermelho
+#   * calibração OFF / ON
+#   * score do vermelho
+#   * confiança da leitura
+#
+# Limitação importante:
+# - esta versão NÃO faz contagem contínua em vídeo em tempo real.
+# - o modo "IA" aqui é assistido/experimental por captura de imagem.
+# - para detecção automática contínua de pulsos, a próxima etapa ideal é:
+#   streamlit-webrtc + OpenCV.
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
+import os
+import secrets
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime
 from pathlib import Path
-import streamlit as st
+from typing import Optional
+
+import numpy as np
 import pandas as pd
+import qrcode
+import streamlit as st
+from PIL import Image
 
-st.set_page_config(page_title="PulseLab Secure", page_icon="🔒", layout="wide")
+st.set_page_config(page_title="PulseLab v5", page_icon="⚡", layout="wide")
 
-DB_PATH = Path("security_audit.db")
+APP_DIR = Path(".")
+DB_PATH = APP_DIR / "pulselab_v5.db"
 
-def get_conn():
+# =============================================================================
+# BANCO
+# =============================================================================
+def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_utc TEXT NOT NULL,
-            email TEXT NOT NULL,
-            name TEXT,
-            event_type TEXT NOT NULL,
-            details TEXT
-        )
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        full_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'tecnico',
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
     """)
+
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS local_limits (
-            email TEXT PRIMARY KEY,
-            is_blocked INTEGER NOT NULL DEFAULT 0,
-            max_tests_per_day INTEGER
-        )
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        actor_username TEXT,
+        event_type TEXT NOT NULL,
+        details TEXT
+    )
     """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS app_config (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+
     conn.commit()
     return conn
 
 CONN = get_conn()
 
-def log_event(email: str, name: str, event_type: str, details: str = ""):
+# =============================================================================
+# HELPERS
+# =============================================================================
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def log_event(actor: str, event_type: str, details: str = "") -> None:
     CONN.execute(
-        "INSERT INTO audit_log (ts_utc, email, name, event_type, details) VALUES (?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), email, name, event_type, details),
+        "INSERT INTO audit_log (ts, actor_username, event_type, details) VALUES (?, ?, ?, ?)",
+        (now_str(), actor, event_type, details),
     )
     CONN.commit()
 
-def upsert_limit(email: str, is_blocked: int, max_tests_per_day):
-    CONN.execute(
-        """
-        INSERT INTO local_limits(email, is_blocked, max_tests_per_day)
-        VALUES (?, ?, ?)
-        ON CONFLICT(email) DO UPDATE SET
-            is_blocked=excluded.is_blocked,
-            max_tests_per_day=excluded.max_tests_per_day
-        """,
-        (email, is_blocked, max_tests_per_day),
-    )
-    CONN.commit()
+def count_users() -> int:
+    row = CONN.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+    return int(row["c"] or 0)
 
-def get_local_limit(email: str):
-    row = CONN.execute(
-        "SELECT is_blocked, max_tests_per_day FROM local_limits WHERE email = ?",
-        (email,),
-    ).fetchone()
+def get_user_by_username(username: str):
+    return CONN.execute("SELECT * FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+
+def verify_login(username: str, password: str):
+    row = get_user_by_username(username)
     if not row:
-        return False, None
-    return bool(row[0]), row[1]
+        return None
+    if not int(row["is_active"]):
+        return None
+    if row["password_hash"] != sha256_text(password):
+        return None
+    return row
 
-def tests_today(email: str) -> int:
-    row = CONN.execute(
+def create_user(username: str, full_name: str, password: str, role: str = "tecnico", is_active: bool = True):
+    ts = now_str()
+    CONN.execute(
         """
-        SELECT COUNT(*)
-        FROM audit_log
-        WHERE email = ?
-          AND event_type = 'finish_test'
-          AND date(ts_utc) = date('now')
+        INSERT INTO users (username, full_name, password_hash, role, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (email,),
-    ).fetchone()
-    return int(row[0] or 0)
+        (username.strip().lower(), full_name.strip(), sha256_text(password), role, 1 if is_active else 0, ts, ts),
+    )
+    CONN.commit()
 
-def get_secret_list(name: str):
-    try:
-        value = st.secrets.get(name, [])
-        if isinstance(value, str):
-            return [value.strip().lower()] if value.strip() else []
-        return [str(x).strip().lower() for x in value]
-    except Exception:
-        return []
+def update_user_status(username: str, is_active: bool):
+    CONN.execute(
+        "UPDATE users SET is_active=?, updated_at=? WHERE lower(username)=lower(?)",
+        (1 if is_active else 0, now_str(), username),
+    )
+    CONN.commit()
 
-ALLOWED_EMAILS = set(get_secret_list("allowed_emails"))
-ADMIN_EMAILS = set(get_secret_list("admin_emails"))
+def update_user_role(username: str, role: str):
+    CONN.execute(
+        "UPDATE users SET role=?, updated_at=? WHERE lower(username)=lower(?)",
+        (role, now_str(), username),
+    )
+    CONN.commit()
 
-def login_screen():
-    st.title("🔒 PulseLab v4 protegido")
-    st.info("Configure OIDC no secrets.toml e publique em HTTPS.")
-    if st.button("Entrar", use_container_width=True):
-        st.login()
-    st.stop()
+def update_user_password(username: str, password: str):
+    CONN.execute(
+        "UPDATE users SET password_hash=?, updated_at=? WHERE lower(username)=lower(?)",
+        (sha256_text(password), now_str(), username),
+    )
+    CONN.commit()
 
-if not st.user.is_logged_in:
-    login_screen()
+def list_users_df() -> pd.DataFrame:
+    rows = CONN.execute("""
+        SELECT id, username, full_name, role, is_active, created_at, updated_at
+        FROM users
+        ORDER BY role DESC, username ASC
+    """).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["id", "username", "full_name", "role", "is_active", "created_at", "updated_at"])
+    return pd.DataFrame([dict(r) for r in rows])
 
-EMAIL = str(st.user.get("email", "")).strip().lower()
-NAME = str(st.user.get("name", "")).strip() or EMAIL
-IS_ADMIN = EMAIL in ADMIN_EMAILS
+def get_config(key: str, default: str = "") -> str:
+    row = CONN.execute("SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
+    return default if row is None else str(row["value"] or "")
 
-if not EMAIL:
-    st.error("Email não retornado pelo provedor OIDC.")
-    st.stop()
+def set_config(key: str, value: str):
+    CONN.execute("""
+        INSERT INTO app_config(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, value))
+    CONN.commit()
 
-if ALLOWED_EMAILS and EMAIL not in ALLOWED_EMAILS and not IS_ADMIN:
-    st.error("Seu e-mail não está autorizado.")
-    st.stop()
-
-blocked, daily_limit = get_local_limit(EMAIL)
-if blocked and not IS_ADMIN:
-    st.error("Seu acesso foi bloqueado pelo administrador.")
-    st.stop()
-
-if daily_limit is not None and tests_today(EMAIL) >= daily_limit and not IS_ADMIN:
-    st.error(f"Você atingiu o limite diário de {daily_limit} ensaios.")
-    st.stop()
-
-if "secure_login_logged" not in st.session_state:
-    log_event(EMAIL, NAME, "login", "Sessão autenticada")
-    st.session_state.secure_login_logged = True
-
-# Cabeçalho de segurança
-h1, h2, h3 = st.columns([3, 1.4, 1])
-with h1:
-    st.markdown("### 🔒 Ambiente protegido")
-with h2:
-    st.write(f"**{NAME}**")
-    st.caption(EMAIL)
-with h3:
-    if st.button("Sair", use_container_width=True):
-        log_event(EMAIL, NAME, "logout", "Logout manual")
-        st.logout()
-
-menu = ["App v4", "Meu histórico"]
-if IS_ADMIN:
-    menu.append("Admin")
-aba = st.radio("Menu seguro", menu, horizontal=True, label_visibility="collapsed")
-
-if aba == "Meu histórico":
-    st.subheader("Seu histórico")
-    rows = CONN.execute(
-        "SELECT ts_utc, event_type, details FROM audit_log WHERE email=? ORDER BY id DESC LIMIT 100",
-        (EMAIL,),
-    ).fetchall()
-    if rows:
-        st.dataframe(pd.DataFrame(rows, columns=["ts_utc", "event_type", "details"]), use_container_width=True, hide_index=True)
-    else:
-        st.info("Sem eventos ainda.")
-    st.stop()
-
-if aba == "Admin":
-    st.subheader("Painel admin")
-    total_users = CONN.execute("SELECT COUNT(DISTINCT email) FROM audit_log").fetchone()[0]
-    total_events = CONN.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-    tests_today_total = CONN.execute(
-        "SELECT COUNT(*) FROM audit_log WHERE event_type='finish_test' AND date(ts_utc)=date('now')"
-    ).fetchone()[0]
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Usuários únicos", int(total_users or 0))
-    k2.metric("Eventos", int(total_events or 0))
-    k3.metric("Ensaios hoje", int(tests_today_total or 0))
-
-    st.markdown("#### Bloquear / limitar usuário")
-    target_email = st.text_input("E-mail do usuário", placeholder="usuario@empresa.com").strip().lower()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        block = st.toggle("Bloquear usuário", value=False)
-    with c2:
-        limit_enabled = st.toggle("Ativar limite diário", value=False)
-    with c3:
-        limit_value = st.number_input("Máx. ensaios/dia", min_value=1, value=5, step=1, disabled=not limit_enabled)
-
-    if st.button("Salvar regra", use_container_width=True, disabled=not target_email):
-        upsert_limit(target_email, 1 if block else 0, int(limit_value) if limit_enabled else None)
-        log_event(EMAIL, NAME, "admin_update_limit", f"target={target_email}; blocked={block}; limit={int(limit_value) if limit_enabled else None}")
-        st.success("Regra salva.")
-
-    rows = CONN.execute("SELECT email, is_blocked, max_tests_per_day FROM local_limits ORDER BY email").fetchall()
-    if rows:
-        st.dataframe(pd.DataFrame(rows, columns=["email", "is_blocked", "max_tests_per_day"]), use_container_width=True, hide_index=True)
-
-    st.markdown("#### Últimos eventos")
-    ev = CONN.execute("SELECT ts_utc, email, name, event_type, details FROM audit_log ORDER BY id DESC LIMIT 200").fetchall()
-    if ev:
-        st.dataframe(pd.DataFrame(ev, columns=["ts_utc", "email", "name", "event_type", "details"]), use_container_width=True, hide_index=True)
-    st.stop()
-
-# =========================
-# Abaixo: V4 aprovado
-# =========================
-# PulseLab - Ensaio Teste v4
-# Atualizações:
-# - botão QR Code nas configurações
-# - campo "Tempo de ensaio" menor e ao lado de "Meta de pulsos"
-# - botão para ocultar/exibir tabela de parâmetros
-# - botão em configurações para upload de imagem/logo do app
-# - pequena atualização de inteligência:
-#   * sugestão de robustez do ensaio
-#   * alerta de poucos pulsos
-#   * sugestão automática mais clara
-
-import base64
-import io
-import time
-import socket
-from datetime import datetime
-from pathlib import Path
-
-import streamlit as st
-import numpy as np
-import pandas as pd
-import qrcode
-from PIL import Image
-
-st.set_page_config(page_title="PulseLab Ensaio", layout="wide")
-
-# =========================================================
+# =============================================================================
 # ESTADO
-# =========================================================
+# =============================================================================
 def init_state():
     defaults = {
-        "page": "ensaio",
+        "auth_user": None,
+        "page": "Ensaio",
         "pulsos": 0,
         "rodando": False,
         "inicio": None,
         "fim": None,
         "resultado": None,
-        "ultimo_relatorio": None,
-        "historico": [],
+        "historico_local": [],
+        "modo_interface": "Mobile",
         "camera_habilitada": True,
         "mostrar_qrcode": False,
-        "modo_interface": "Mobile",
         "tempo_automatico": True,
         "alvo_pulsos_auto": 10,
         "tempo_minimo_seg": 5,
@@ -250,6 +203,7 @@ def init_state():
         "mostrar_tabela_parametros": True,
         "app_logo_bytes": None,
         "app_logo_name": None,
+        "admin_new_pwd": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -257,29 +211,157 @@ def init_state():
 
 init_state()
 
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem; padding-bottom: 2rem;}
+div[data-testid="stMetric"] {
+    background: #fff;
+    border: 1px solid #e6e6e6;
+    border-radius: 14px;
+    padding: 0.5rem 0.7rem;
+}
+.big-live-box {
+    border: 2px solid #d9d9d9;
+    border-radius: 18px;
+    padding: 1rem;
+    background: #ffffff;
+    margin-bottom: 1rem;
+}
+.live-title {
+    font-size: 1.2rem;
+    font-weight: 700;
+    margin-bottom: 0.4rem;
+}
+.card-soft {
+    background: #fff;
+    border: 1px solid #e9e9e9;
+    border-radius: 16px;
+    padding: 1rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
 CLASSES = {
     "A (2%)": 4.00,
     "B (1%)": 1.30,
     "C (0.5%)": 0.70,
     "D (0.2%)": 0.30,
 }
-
 CONSTANTES = [0.1, 0.2, 0.5, 1.0, 1.25, 1.5, 2.0, 2.4, 3.6, 4.8, 5.4, 6.25, 7.2, 8.0, 9.6, 10.8, 21.6]
 
-# =========================================================
-# FUNÇÕES
-# =========================================================
-def set_page(page):
+def set_page(page: str):
     st.session_state.page = page
     st.rerun()
 
+def get_local_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+def render_qrcode(porta: int = 8501):
+    url = f"http://{get_local_ip()}:{porta}"
+    qr = qrcode.QRCode(version=2, box_size=8, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    st.image(buf, width=220)
+    st.code(url, language=None)
+
+def salvar_logo(uploaded_file):
+    if uploaded_file is not None:
+        st.session_state.app_logo_bytes = uploaded_file.getvalue()
+        st.session_state.app_logo_name = uploaded_file.name
+
+# =============================================================================
+# AUTH - BOOTSTRAP
+# =============================================================================
+def bootstrap_first_admin():
+    st.title("⚡ PulseLab v5")
+    st.subheader("Primeiro acesso - criar administrador master")
+    st.info("Como ainda não existe usuário, crie agora o administrador principal do sistema.")
+
+    with st.form("bootstrap_admin_form"):
+        username = st.text_input("Usuário admin", placeholder="admin ou seu email")
+        full_name = st.text_input("Nome completo")
+        password = st.text_input("Senha", type="password")
+        password2 = st.text_input("Confirmar senha", type="password")
+        submitted = st.form_submit_button("Criar administrador")
+
+    if submitted:
+        username = username.strip().lower()
+        if not username or not full_name.strip() or not password:
+            st.error("Preencha todos os campos.")
+            st.stop()
+        if password != password2:
+            st.error("As senhas não conferem.")
+            st.stop()
+        try:
+            create_user(username, full_name.strip(), password, role="admin", is_active=True)
+            log_event(username, "bootstrap_admin", f"Administrador master criado: {username}")
+            st.success("Administrador criado com sucesso. Faça login abaixo.")
+            time.sleep(1)
+            st.rerun()
+        except sqlite3.IntegrityError:
+            st.error("Esse usuário já existe.")
+
+    st.stop()
+
+def login_screen():
+    st.title("🔒 PulseLab v5")
+    st.subheader("Login interno")
+    st.caption("Administração interna de usuários + detecção experimental de pulso LED")
+
+    with st.form("login_form"):
+        username = st.text_input("Usuário")
+        password = st.text_input("Senha", type="password")
+        login_submitted = st.form_submit_button("Entrar")
+
+    if login_submitted:
+        row = verify_login(username.strip().lower(), password)
+        if row is None:
+            st.error("Usuário, senha ou status inválido.")
+        else:
+            st.session_state.auth_user = {
+                "username": row["username"],
+                "full_name": row["full_name"],
+                "role": row["role"],
+            }
+            log_event(row["username"], "login", "Login efetuado")
+            st.rerun()
+
+    st.stop()
+
+if count_users() == 0:
+    bootstrap_first_admin()
+
+if st.session_state.auth_user is None:
+    login_screen()
+
+AUTH = st.session_state.auth_user
+IS_ADMIN = AUTH["role"] == "admin"
+
+# =============================================================================
+# ENSAIO HELPERS
+# =============================================================================
 def reset_ensaio():
     st.session_state.pulsos = 0
     st.session_state.rodando = False
     st.session_state.inicio = None
     st.session_state.fim = None
     st.session_state.resultado = None
-    st.session_state.ultimo_relatorio = None
 
 def iniciar_ensaio():
     st.session_state.pulsos = 0
@@ -287,7 +369,7 @@ def iniciar_ensaio():
     st.session_state.inicio = time.time()
     st.session_state.fim = None
     st.session_state.resultado = None
-    st.session_state.ultimo_relatorio = None
+    log_event(AUTH["username"], "start_test", f"modo={st.session_state.captura_modo}")
 
 def registrar_pulso():
     if st.session_state.rodando:
@@ -329,43 +411,6 @@ def classificar_robustez(meta_pulsos, pulsos_realizados, tempo_seg):
         return "MÉDIA"
     return "BAIXA"
 
-def finalizar_ensaio(tensao, corrente, fp, constante, tempo_configurado, meta_pulsos):
-    st.session_state.rodando = False
-    st.session_state.fim = time.time()
-    tempo_real = max(st.session_state.fim - st.session_state.inicio, 0.001) if st.session_state.inicio else float(tempo_configurado)
-    potencia = calcular_potencia(tensao, corrente, fp)
-    e_teorica = energia_teorica_wh(potencia, tempo_real)
-    e_medida = energia_medida_wh(st.session_state.pulsos, constante)
-    erro = calcular_erro(e_medida, e_teorica)
-    tolerancia = float(st.session_state.tolerancia)
-    status = "APROVADO" if abs(erro) <= tolerancia else "REPROVADO"
-    robustez = classificar_robustez(int(meta_pulsos), int(st.session_state.pulsos), float(tempo_real))
-
-    rel = {
-        "datahora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "classe": st.session_state.classe,
-        "captura_modo": st.session_state.captura_modo,
-        "tensao": round(tensao, 2),
-        "corrente": round(corrente, 2),
-        "fp": round(fp, 2),
-        "potencia": round(potencia, 2),
-        "constante": float(constante),
-        "tempo_configurado": round(float(tempo_configurado), 2),
-        "tempo_real": round(float(tempo_real), 2),
-        "meta_pulsos": int(meta_pulsos),
-        "pulsos": int(st.session_state.pulsos),
-        "energia_teorica": round(e_teorica, 4),
-        "energia_medida": round(e_medida, 4),
-        "erro": round(erro, 4),
-        "tolerancia": round(tolerancia, 2),
-        "status": status,
-        "robustez": robustez,
-    }
-    st.session_state.resultado = rel
-    st.session_state.ultimo_relatorio = rel
-    st.session_state.historico.insert(0, rel)
-    set_page("resultado")
-
 def tabela_parametros(potencia, constante, tempo_pulso, tempo_sug, meta_pulsos):
     robustez_prevista = classificar_robustez(int(meta_pulsos), int(meta_pulsos), float(tempo_sug))
     return pd.DataFrame([
@@ -378,84 +423,76 @@ def tabela_parametros(potencia, constante, tempo_pulso, tempo_sug, meta_pulsos):
         {"Campo": "Debounce (ms)", "Valor": int(st.session_state.debounce_ms)},
     ])
 
-def analisar_led(uploaded_file):
+# =============================================================================
+# IA EXPERIMENTAL LED
+# =============================================================================
+def analyze_led_image(uploaded_file):
     if uploaded_file is None:
-        return None, None
+        return None, None, None
+
     img = Image.open(uploaded_file).convert("RGB")
     arr = np.array(img)
-    r = arr[:, :, 0].mean()
-    g = arr[:, :, 1].mean()
-    b = arr[:, :, 2].mean()
+
+    r = float(arr[:, :, 0].mean())
+    g = float(arr[:, :, 1].mean())
+    b = float(arr[:, :, 2].mean())
     red_score = r - ((g + b) / 2.0)
 
     if st.session_state.calib_off is not None and st.session_state.calib_on is not None:
-        limiar = (st.session_state.calib_off + st.session_state.calib_on) / 2.0
-        status = "LED LIGADO" if red_score >= limiar else "LED DESLIGADO"
+        threshold = (st.session_state.calib_off + st.session_state.calib_on) / 2.0
+        status = "LED LIGADO" if red_score >= threshold else "LED DESLIGADO"
+        distance = abs(red_score - threshold)
+        confidence = min(99.0, max(40.0, 40.0 + distance))
     else:
         status = "LED LIGADO" if red_score > 20 else "LED DESLIGADO"
+        confidence = 55.0 if abs(red_score - 20) < 10 else 78.0
 
-    tabela = pd.DataFrame([
+    df = pd.DataFrame([
         {"Métrica": "R médio", "Valor": round(r, 2)},
         {"Métrica": "G médio", "Valor": round(g, 2)},
         {"Métrica": "B médio", "Valor": round(b, 2)},
         {"Métrica": "Red Score", "Valor": round(red_score, 2)},
         {"Métrica": "Status óptico", "Valor": status},
+        {"Métrica": "Confiança (%)", "Valor": round(confidence, 1)},
         {"Métrica": "Calibração OFF", "Valor": st.session_state.calib_off},
         {"Métrica": "Calibração ON", "Valor": st.session_state.calib_on},
     ])
-    return img, tabela
+    return img, df, red_score
 
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
-
-def render_qrcode(porta=8501):
-    ip = get_local_ip()
-    url = f"http://{ip}:{porta}"
-    qr = qrcode.QRCode(version=2, box_size=8, border=2)
-    qr.add_data(url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-    st.image(buffer, width=220)
-    st.code(url, language=None)
-    st.caption("Abra esse endereço no navegador do celular, desde que celular e PC estejam na mesma rede Wi‑Fi.")
-
-def salvar_logo(uploaded_file):
-    if uploaded_file is not None:
-        st.session_state.app_logo_bytes = uploaded_file.getvalue()
-        st.session_state.app_logo_name = uploaded_file.name
-
-# =========================================================
+# =============================================================================
 # TOPO
-# =========================================================
-top1, top2 = st.columns([4, 1])
-with top1:
+# =============================================================================
+left, mid, right = st.columns([3, 1.3, 1.2])
+with left:
     if st.session_state.app_logo_bytes:
         b64 = base64.b64encode(st.session_state.app_logo_bytes).decode("utf-8")
         st.markdown(
-            f'<div style="display:flex;align-items:center;gap:12px;"><img src="data:image/png;base64,{b64}" style="height:48px;border-radius:8px;"><h1 style="margin:0;">PulseLab - Ensaio</h1></div>',
+            f'<div style="display:flex;align-items:center;gap:12px;"><img src="data:image/png;base64,{b64}" style="height:48px;border-radius:8px;"><h1 style="margin:0;">PulseLab v5</h1></div>',
             unsafe_allow_html=True
         )
     else:
-        st.title("⚡ PulseLab - Ensaio")
-with top2:
-    if st.button("⚙️ Configurações", use_container_width=True):
-        set_page("config")
+        st.title("⚡ PulseLab v5")
 
-# =========================================================
-# PÁGINAS
-# =========================================================
-if st.session_state.page == "ensaio":
+with mid:
+    st.write(f"**Usuário:** {AUTH['full_name']}")
+    st.caption(f"{AUTH['username']} • {AUTH['role']}")
+
+with right:
+    if st.button("Sair", use_container_width=True):
+        log_event(AUTH["username"], "logout", "Logout manual")
+        st.session_state.auth_user = None
+        st.rerun()
+
+menu_options = ["Ensaio", "Histórico", "Configurações"]
+if IS_ADMIN:
+    menu_options.append("Admin")
+
+selected = st.radio("Menu", menu_options, horizontal=True, label_visibility="collapsed")
+
+# =============================================================================
+# ENSAIO
+# =============================================================================
+if selected == "Ensaio":
     col1, col2, col3 = st.columns(3)
     with col1:
         tensao = st.number_input("Tensão (V)", value=220.0, step=1.0)
@@ -466,18 +503,23 @@ if st.session_state.page == "ensaio":
 
     a1, a2, a3 = st.columns(3)
     with a1:
-        st.session_state.classe = st.selectbox("Classe do medidor", list(CLASSES.keys()), index=list(CLASSES.keys()).index(st.session_state.classe))
+        classe_keys = list(CLASSES.keys())
+        idx_classe = classe_keys.index(st.session_state.classe)
+        st.session_state.classe = st.selectbox("Classe do medidor", classe_keys, index=idx_classe)
         st.session_state.tolerancia = CLASSES[st.session_state.classe]
     with a2:
         constante = st.selectbox("Constante Kh/Kd (Wh/pulso)", CONSTANTES, index=CONSTANTES.index(3.6))
     with a3:
-        st.session_state.captura_modo = st.selectbox("Modo de captura", ["Manual", "LED Vermelho (diagnóstico)", "Tarja Eletromecânico (futuro)"])
+        st.session_state.captura_modo = st.selectbox(
+            "Modo de captura",
+            ["Manual", "IA LED Vermelho (experimental)", "Tarja Eletromecânico (futuro)"],
+        )
 
     potencia = calcular_potencia(tensao, corrente, fp)
     t_pulso = tempo_por_pulso_seg(potencia, constante)
     t_sug = tempo_sugerido_seg(potencia, constante)
 
-    c1, c2, c3 = st.columns([1, 1, 1.2])
+    c1, c2, c3 = st.columns([1, 1, 0.9])
     with c1:
         st.session_state.tempo_automatico = st.toggle("Tempo automático", value=st.session_state.tempo_automatico)
     with c2:
@@ -488,72 +530,128 @@ if st.session_state.page == "ensaio":
         else:
             tempo_ensaio = st.number_input("Tempo de ensaio (s)", value=max(float(t_sug), 1.0), min_value=1.0, step=1.0)
 
-    t1, t2 = st.columns([1, 3])
-    with t1:
-        if st.button("📊 Ocultar/Exibir parâmetros", use_container_width=True):
-            st.session_state.mostrar_tabela_parametros = not st.session_state.mostrar_tabela_parametros
-            st.rerun()
-    with t2:
-        st.caption("A tabela ajuda na conferência do ensaio, mas pode ser ocultada para deixar a tela mais limpa.")
+    if not st.session_state.rodando:
+        p1, p2 = st.columns([1, 3])
+        with p1:
+            if st.button("📊 Ocultar/Exibir parâmetros", use_container_width=True):
+                st.session_state.mostrar_tabela_parametros = not st.session_state.mostrar_tabela_parametros
+                st.rerun()
+        with p2:
+            st.caption("A tabela ajuda na conferência do ensaio, mas pode ser ocultada para deixar a tela mais limpa.")
 
-    if st.session_state.mostrar_tabela_parametros:
-        st.subheader("Tabela de parâmetros automáticos")
-        st.dataframe(
-            tabela_parametros(potencia, constante, t_pulso, t_sug, meta_pulsos),
-            use_container_width=True,
-            hide_index=True
-        )
+        if st.session_state.mostrar_tabela_parametros:
+            st.dataframe(
+                tabela_parametros(potencia, constante, t_pulso, t_sug, meta_pulsos),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     if int(meta_pulsos) < 5:
         st.warning("Meta de pulsos muito baixa. Para um ensaio mais robusto, prefira pelo menos 5 pulsos.")
     elif int(meta_pulsos) >= 10:
         st.success("Meta de pulsos boa para teste operacional mais consistente.")
 
-    if st.session_state.captura_modo == "LED Vermelho (diagnóstico)":
-        b1, b2 = st.columns([1, 3])
-        with b1:
-            if st.button("🎯 Calibração do LED", use_container_width=True):
-                st.session_state.calibracao_aberta = not st.session_state.calibracao_aberta
-                st.rerun()
-        with b2:
-            st.info(f"Calibração: {'ativa' if st.session_state.calibracao_aberta else 'oculta'}")
+    if st.session_state.captura_modo == "IA LED Vermelho (experimental)":
+        if st.session_state.rodando:
+            st.markdown('<div class="big-live-box">', unsafe_allow_html=True)
+            st.markdown('<div class="live-title">🔴 IA LED - captura assistida</div>', unsafe_allow_html=True)
+            st.caption(
+                "Nesta v5, a IA é experimental por captura. "
+                "Ela indica estado do LED e confiança, mas não faz contagem contínua automática ainda."
+            )
+            live_file = st.camera_input("Captura atual do LED", key="camera_led_live")
+            img, metrics_df, _ = analyze_led_image(live_file)
+            if img is not None:
+                st.image(img, caption="Captura atual", use_container_width=True)
+                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Aguardando captura do LED.")
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            b1, b2 = st.columns([1, 3])
+            with b1:
+                if st.button("🎯 Calibração IA LED", use_container_width=True):
+                    st.session_state.calibracao_aberta = not st.session_state.calibracao_aberta
+                    st.rerun()
+            with b2:
+                st.info(f"Calibração: {'ativa' if st.session_state.calibracao_aberta else 'oculta'}")
 
-        if st.session_state.calibracao_aberta:
-            foto = st.camera_input("Capturar LED") if st.session_state.camera_habilitada else None
-            img, met = analisar_led(foto)
-            if foto is not None and img is not None:
-                st.image(img, caption="Imagem capturada", use_container_width=True)
-                st.dataframe(met, use_container_width=True, hide_index=True)
-                red_score = float(met.loc[met["Métrica"] == "Red Score", "Valor"].values[0])
+            if st.session_state.calibracao_aberta:
+                calib_file = st.camera_input("Capturar referência do LED", key="camera_led_calib")
+                img, metrics_df, red_score = analyze_led_image(calib_file)
+                if img is not None:
+                    st.image(img, caption="Imagem para análise", use_container_width=True)
+                    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
-                cc1, cc2, cc3 = st.columns(3)
-                with cc1:
-                    if st.button("Salvar OFF", use_container_width=True):
-                        st.session_state.calib_off = red_score
-                        st.rerun()
-                with cc2:
-                    if st.button("Salvar ON", use_container_width=True):
-                        st.session_state.calib_on = red_score
-                        st.rerun()
-                with cc3:
-                    if st.button("Limpar calibração", use_container_width=True):
-                        st.session_state.calib_off = None
-                        st.session_state.calib_on = None
-                        st.rerun()
+                    ccal1, ccal2, ccal3 = st.columns(3)
+                    with ccal1:
+                        if st.button("Salvar OFF", use_container_width=True):
+                            st.session_state.calib_off = red_score
+                            st.success(f"OFF salvo: {round(red_score, 2)}")
+                    with ccal2:
+                        if st.button("Salvar ON", use_container_width=True):
+                            st.session_state.calib_on = red_score
+                            st.success(f"ON salvo: {round(red_score, 2)}")
+                    with ccal3:
+                        if st.button("Limpar calibração", use_container_width=True):
+                            st.session_state.calib_off = None
+                            st.session_state.calib_on = None
+                            st.success("Calibração limpa.")
 
     st.subheader("Execução do ensaio")
 
-    e1, e2, e3 = st.columns(3)
-    with e1:
-        if st.button("▶ Iniciar", use_container_width=True):
-            iniciar_ensaio()
-            st.rerun()
-    with e2:
-        if st.button("➕ Pulso", use_container_width=True):
+    if st.session_state.modo_interface == "Mobile":
+        b1, b2, b3 = st.columns(3)
+    else:
+        b1, b2, b3 = st.columns([1.3, 1, 1])
+
+    with b1:
+        if st.session_state.rodando:
+            if st.button("⏹ Finalizar", use_container_width=True):
+                tempo_real = max(time.time() - st.session_state.inicio, 0.001)
+                e_teorica = energia_teorica_wh(potencia, tempo_real)
+                e_medida = energia_medida_wh(st.session_state.pulsos, constante)
+                erro = calcular_erro(e_medida, e_teorica)
+                robustez = classificar_robustez(int(meta_pulsos), int(st.session_state.pulsos), float(tempo_real))
+                status = "APROVADO" if abs(erro) <= float(st.session_state.tolerancia) else "REPROVADO"
+
+                st.session_state.resultado = {
+                    "datahora": now_str(),
+                    "usuario": AUTH["username"],
+                    "classe": st.session_state.classe,
+                    "captura_modo": st.session_state.captura_modo,
+                    "tensao": round(tensao, 2),
+                    "corrente": round(corrente, 2),
+                    "fp": round(fp, 2),
+                    "potencia": round(potencia, 2),
+                    "constante": float(constante),
+                    "tempo_configurado": round(float(tempo_ensaio), 2),
+                    "tempo_real": round(float(tempo_real), 2),
+                    "meta_pulsos": int(meta_pulsos),
+                    "pulsos": int(st.session_state.pulsos),
+                    "energia_teorica": round(e_teorica, 4),
+                    "energia_medida": round(e_medida, 4),
+                    "erro": round(erro, 4),
+                    "tolerancia": round(float(st.session_state.tolerancia), 2),
+                    "status": status,
+                    "robustez": robustez,
+                }
+                st.session_state.historico_local.insert(0, st.session_state.resultado)
+                log_event(AUTH["username"], "finish_test", f"status={status}; erro={round(erro,4)}")
+                st.session_state.rodando = False
+                st.rerun()
+        else:
+            if st.button("▶ Iniciar", use_container_width=True):
+                iniciar_ensaio()
+                st.rerun()
+
+    with b2:
+        if st.button("+", use_container_width=True):
             registrar_pulso()
             st.rerun()
-    with e3:
-        if st.button("➖ Remover", use_container_width=True):
+
+    with b3:
+        if st.button("-", use_container_width=True):
             remover_pulso()
             st.rerun()
 
@@ -576,14 +674,9 @@ if st.session_state.page == "ensaio":
         st.progress(progresso)
         st.caption(f"Tempo configurado: {round(float(tempo_ensaio),2)} s | Restante: {round(restante,2)} s")
 
-        f1, f2 = st.columns(2)
-        with f1:
-            if st.button("⏹ Finalizar teste", use_container_width=True):
-                finalizar_ensaio(tensao, corrente, fp, constante, tempo_ensaio, meta_pulsos)
-        with f2:
-            if st.button("🔄 Resetar ensaio", use_container_width=True):
-                reset_ensaio()
-                st.rerun()
+        if st.button("🔄 Resetar ensaio", use_container_width=True):
+            reset_ensaio()
+            st.rerun()
 
         if progresso < 1.0:
             time.sleep(1)
@@ -591,78 +684,45 @@ if st.session_state.page == "ensaio":
         else:
             st.info("Tempo atingido. Você pode finalizar o teste ou continuar registrando pulsos.")
     else:
-        st.info("O ensaio ainda não foi iniciado.")
-
-elif st.session_state.page == "resultado":
-    rel = st.session_state.resultado
-    if not rel:
-        st.warning("Nenhum resultado disponível.")
-    else:
-        st.subheader("Resultado do ensaio")
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Erro (%)", rel["erro"])
-        c2.metric("Tolerância", f"± {rel['tolerancia']:.2f}%")
-        c3.metric("Pulsos", rel["pulsos"])
-        c4.metric("Tempo real (s)", rel["tempo_real"])
-        c5.metric("Robustez", rel["robustez"])
-
-        if rel["status"] == "APROVADO":
-            st.success("✅ APROVADO")
+        if st.session_state.resultado is None:
+            st.info("O ensaio ainda não foi iniciado.")
         else:
-            st.error("❌ REPROVADO")
+            rel = st.session_state.resultado
+            st.subheader("Resultado do último ensaio")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Erro (%)", rel["erro"])
+            c2.metric("Tolerância", f"± {rel['tolerancia']:.2f}%")
+            c3.metric("Pulsos", rel["pulsos"])
+            c4.metric("Tempo real (s)", rel["tempo_real"])
+            c5.metric("Robustez", rel["robustez"])
+            if rel["status"] == "APROVADO":
+                st.success("✅ APROVADO")
+            else:
+                st.error("❌ REPROVADO")
 
-        st.dataframe(pd.DataFrame([
-            {"Campo": "Classe", "Valor": rel["classe"]},
-            {"Campo": "Modo de captura", "Valor": rel["captura_modo"]},
-            {"Campo": "Tensão (V)", "Valor": rel["tensao"]},
-            {"Campo": "Corrente (A)", "Valor": rel["corrente"]},
-            {"Campo": "FP", "Valor": rel["fp"]},
-            {"Campo": "Potência (W)", "Valor": rel["potencia"]},
-            {"Campo": "Constante (Wh/pulso)", "Valor": rel["constante"]},
-            {"Campo": "Tempo configurado (s)", "Valor": rel["tempo_configurado"]},
-            {"Campo": "Tempo real (s)", "Valor": rel["tempo_real"]},
-            {"Campo": "Meta pulsos", "Valor": rel["meta_pulsos"]},
-            {"Campo": "Pulsos registrados", "Valor": rel["pulsos"]},
-            {"Campo": "Energia teórica (Wh)", "Valor": rel["energia_teorica"]},
-            {"Campo": "Energia medida (Wh)", "Valor": rel["energia_medida"]},
-            {"Campo": "Erro (%)", "Valor": rel["erro"]},
-            {"Campo": "Status", "Valor": rel["status"]},
-        ]), use_container_width=True, hide_index=True)
-
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        if st.button("📋 Histórico", use_container_width=True):
-            set_page("historico")
-    with r2:
-        if st.button("🟢 Reiniciar", use_container_width=True):
-            reset_ensaio()
-            set_page("ensaio")
-    with r3:
-        if st.button("🔴 Finalizar", use_container_width=True):
-            reset_ensaio()
-            set_page("ensaio")
-
-elif st.session_state.page == "historico":
-    st.subheader("Histórico de ensaios")
-    if not st.session_state.historico:
-        st.info("Ainda não há ensaios registrados.")
+# =============================================================================
+# HISTÓRICO
+# =============================================================================
+elif selected == "Histórico":
+    st.subheader("Histórico local da sessão / app")
+    if not st.session_state.historico_local:
+        st.info("Ainda não há ensaios registrados nesta base.")
     else:
-        for i, item in enumerate(st.session_state.historico):
+        for i, item in enumerate(st.session_state.historico_local):
             titulo = f"{item['datahora']} | {item['status']} | erro {item['erro']}%"
             with st.expander(titulo, expanded=(i == 0)):
                 st.dataframe(pd.DataFrame([{"Campo": k, "Valor": v} for k, v in item.items()]), use_container_width=True, hide_index=True)
-    if st.button("⬅ Voltar para resultado", use_container_width=True):
-        set_page("resultado")
 
-elif st.session_state.page == "config":
-    st.subheader("Configurações")
-
+# =============================================================================
+# CONFIG
+# =============================================================================
+elif selected == "Configurações":
+    st.subheader("Configurações do app")
     st.session_state.modo_interface = st.radio(
         "Modo de interface",
         ["Desktop", "Mobile"],
         index=0 if st.session_state.modo_interface == "Desktop" else 1,
-        horizontal=True
+        horizontal=True,
     )
     st.session_state.camera_habilitada = st.toggle("Habilitar câmera no ensaio", value=st.session_state.camera_habilitada)
     st.session_state.tempo_automatico = st.toggle("Usar tempo automático por padrão", value=st.session_state.tempo_automatico)
@@ -682,16 +742,109 @@ elif st.session_state.page == "config":
         salvar_logo(up_logo)
         st.success("Imagem do app atualizada.")
     if st.session_state.app_logo_bytes:
-        st.image(st.session_state.app_logo_bytes, width=160)
-        st.caption(st.session_state.app_logo_name or "Logo carregada")
+        st.image(st.session_state.app_logo_bytes, width=140)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("⬅ Voltar", use_container_width=True):
-            set_page("ensaio")
-    with c2:
-        if st.button("🧹 Limpar calibração LED", use_container_width=True):
-            st.session_state.calib_off = None
-            st.session_state.calib_on = None
-            st.success("Calibração limpa.")
+# =============================================================================
+# ADMIN
+# =============================================================================
+elif selected == "Admin":
+    st.subheader("Painel administrativo")
+    if not IS_ADMIN:
+        st.error("Acesso restrito.")
+        st.stop()
 
+    tab1, tab2, tab3 = st.tabs(["Usuários", "Auditoria", "Minha senha"])
+
+    with tab1:
+        st.markdown("### Cadastro interno de usuários")
+        with st.form("create_user_form"):
+            new_username = st.text_input("Usuário")
+            new_full_name = st.text_input("Nome completo")
+            new_password = st.text_input("Senha inicial", type="password")
+            new_role = st.selectbox("Papel", ["tecnico", "admin"])
+            new_active = st.toggle("Ativo", value=True)
+            save_user = st.form_submit_button("Criar usuário")
+
+        if save_user:
+            try:
+                if not new_username.strip() or not new_full_name.strip() or not new_password:
+                    st.error("Preencha usuário, nome e senha.")
+                else:
+                    create_user(new_username.strip().lower(), new_full_name.strip(), new_password, new_role, new_active)
+                    log_event(AUTH["username"], "create_user", f"user={new_username.strip().lower()}; role={new_role}; active={new_active}")
+                    st.success("Usuário criado com sucesso.")
+            except sqlite3.IntegrityError:
+                st.error("Esse usuário já existe.")
+
+        st.markdown("### Lista de usuários")
+        users_df = list_users_df()
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Alterar usuário existente")
+        usernames = [str(x) for x in users_df["username"].tolist()] if not users_df.empty else []
+        if usernames:
+            sel_user = st.selectbox("Selecionar usuário", usernames)
+            user_row = get_user_by_username(sel_user)
+
+            colu1, colu2, colu3 = st.columns(3)
+            with colu1:
+                status_now = bool(user_row["is_active"])
+                new_status = st.toggle("Ativo", value=status_now, key="admin_status_toggle")
+                if st.button("Salvar status", use_container_width=True):
+                    update_user_status(sel_user, new_status)
+                    log_event(AUTH["username"], "update_user_status", f"user={sel_user}; active={new_status}")
+                    st.success("Status atualizado.")
+                    st.rerun()
+
+            with colu2:
+                role_now = str(user_row["role"])
+                new_user_role = st.selectbox("Papel", ["tecnico", "admin"], index=0 if role_now == "tecnico" else 1, key="admin_role_select")
+                if st.button("Salvar papel", use_container_width=True):
+                    update_user_role(sel_user, new_user_role)
+                    log_event(AUTH["username"], "update_user_role", f"user={sel_user}; role={new_user_role}")
+                    st.success("Papel atualizado.")
+                    st.rerun()
+
+            with colu3:
+                new_pwd = st.text_input("Nova senha", type="password")
+                if st.button("Resetar senha", use_container_width=True):
+                    if not new_pwd:
+                        st.error("Informe a nova senha.")
+                    else:
+                        update_user_password(sel_user, new_pwd)
+                        log_event(AUTH["username"], "reset_password", f"user={sel_user}")
+                        st.success("Senha alterada.")
+                        st.rerun()
+        else:
+            st.info("Nenhum usuário cadastrado além do admin inicial.")
+
+    with tab2:
+        st.markdown("### Auditoria do sistema")
+        rows = CONN.execute(
+            "SELECT ts, actor_username, event_type, details FROM audit_log ORDER BY id DESC LIMIT 500"
+        ).fetchall()
+        if rows:
+            st.dataframe(pd.DataFrame([dict(r) for r in rows]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem eventos auditados ainda.")
+
+    with tab3:
+        st.markdown("### Alterar minha senha")
+        with st.form("my_password_form"):
+            current_pwd = st.text_input("Senha atual", type="password")
+            new_pwd1 = st.text_input("Nova senha", type="password")
+            new_pwd2 = st.text_input("Confirmar nova senha", type="password")
+            save_my_pwd = st.form_submit_button("Salvar nova senha")
+
+        if save_my_pwd:
+            user_row = verify_login(AUTH["username"], current_pwd)
+            if user_row is None:
+                st.error("Senha atual inválida.")
+            elif new_pwd1 != new_pwd2:
+                st.error("As novas senhas não conferem.")
+            elif not new_pwd1:
+                st.error("Informe a nova senha.")
+            else:
+                update_user_password(AUTH["username"], new_pwd1)
+                log_event(AUTH["username"], "change_own_password", "Senha própria alterada")
+                st.success("Senha atualizada com sucesso.")
