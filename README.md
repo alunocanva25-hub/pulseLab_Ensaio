@@ -1,24 +1,35 @@
-# PulseLab v4 aprovado + segurança
+# PulseLab v5 - Admin interno + IA LED experimental
 
-Este kit usa **a v4 aprovada** do ensaio e adiciona por cima:
-- login OIDC
-- whitelist de e-mails
-- admins
-- painel admin
-- bloqueio de usuários
-- limite diário de ensaios
-- auditoria local em SQLite
+## O que esta versão entrega
+- Login interno com SQLite
+- Bootstrap do primeiro admin dentro do próprio app
+- Admin controla usuários sem editar Secrets
+- Cadastro interno de usuários
+- Ativar / bloquear usuários
+- Alterar papel (técnico/admin)
+- Reset de senha
+- Auditoria local
+- Módulo de ensaio estilo v4
+- IA experimental de detecção de LED por captura
 
-## Importante
-- O ensaio é a **base da v4 aprovada**
-- O SQLite local serve para MVP
-- No Streamlit Community Cloud, armazenamento local não é persistente; para produção, use banco externo
+## Limitação
+Esta versão NÃO faz contagem contínua automática por vídeo.
+A "IA de pulso" aqui é experimental e assistida por imagem capturada.
 
-## Secrets
-Use o arquivo `.streamlit/secrets.example.toml` como modelo.
+## Rodar localmente
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Deploy
-1. Suba estes arquivos para o GitHub
-2. Faça deploy no Streamlit Cloud apontando para `app.py`
-3. Cole os secrets no painel do app
-4. Ajuste `redirect_uri` para sua URL publicada + `/oauth2callback`
+## Publicar
+Pode publicar direto no Streamlit Cloud. Como a autenticação é interna, não depende de OIDC.
+
+## Primeiro acesso
+No primeiro acesso, o sistema vai pedir para criar o administrador master.
+
+## Próximo passo técnico
+Para contagem real automática em vídeo:
+- streamlit-webrtc
+- OpenCV
+- debounce óptico contínuo
