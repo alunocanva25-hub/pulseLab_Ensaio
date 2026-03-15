@@ -11,60 +11,77 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-st.set_page_config(page_title="Pulse Detector Vision", page_icon="🔴", layout="wide")
+st.set_page_config(page_title="Pulse Counter Vision", page_icon="🔴", layout="wide")
 
-if "calib_off" not in st.session_state:
-    st.session_state.calib_off = None
-if "calib_on" not in st.session_state:
-    st.session_state.calib_on = None
-if "saved_message" not in st.session_state:
-    st.session_state.saved_message = ""
-if "last_announced_pulse" not in st.session_state:
-    st.session_state.last_announced_pulse = 0
-if "beep_enabled" not in st.session_state:
-    st.session_state.beep_enabled = True
-if "beep_ms" not in st.session_state:
-    st.session_state.beep_ms = 120
-if "beep_freq" not in st.session_state:
-    st.session_state.beep_freq = 880
+for k, v in {"calib_off": None, "calib_on": None, "saved_message": ""}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-
-class DetectorPulso:
-    def __init__(self, limiar_on: float = 30.0, limiar_off: float = 20.0, debounce: float = 0.2):
-        self.estado_anterior = "OFF"
-        self.pulsos = 0
-        self.ultimo_pulso = 0.0
+class ContadorPulso:
+    def __init__(self, limiar_on: float, limiar_off: float, debounce_s: float = 0.25, min_on_s: float = 0.08, min_off_s: float = 0.08):
         self.limiar_on = float(limiar_on)
         self.limiar_off = float(limiar_off)
-        self.debounce = float(debounce)
+        self.debounce_s = float(debounce_s)
+        self.min_on_s = float(min_on_s)
+        self.min_off_s = float(min_off_s)
+        self.estado = "OFF"
+        self.pulsos = 0
+        self.ultimo_pulso_ts = 0.0
+        self.ultima_transicao_ts = time.time()
+        self.logs = deque(maxlen=200)
+        self.intervalo_medio = None
 
-    def atualizar(self, red_score: float):
-        if red_score > self.limiar_on:
-            estado_atual = "ON"
-        elif red_score < self.limiar_off:
-            estado_atual = "OFF"
-        else:
-            estado_atual = self.estado_anterior
+    def atualizar_parametros(self, limiar_on, limiar_off, debounce_s, min_on_s, min_off_s):
+        self.limiar_on = float(limiar_on)
+        self.limiar_off = float(limiar_off)
+        self.debounce_s = float(debounce_s)
+        self.min_on_s = float(min_on_s)
+        self.min_off_s = float(min_off_s)
 
+    def atualizar(self, score: float, confidence: float):
         agora = time.time()
+        pulso_confirmado = False
+        quality = "-"
+        if self.estado == "OFF":
+            tempo_off = agora - self.ultima_transicao_ts
+            if score >= self.limiar_on and tempo_off >= self.min_off_s:
+                self.estado = "ON"
+                self.ultima_transicao_ts = agora
+        elif self.estado == "ON":
+            tempo_on = agora - self.ultima_transicao_ts
+            if score <= self.limiar_off:
+                if tempo_on >= self.min_on_s and (agora - self.ultimo_pulso_ts) >= self.debounce_s:
+                    self.pulsos += 1
+                    pulso_confirmado = True
+                    quality = "ALTA" if confidence >= 80 else ("MÉDIA" if confidence >= 60 else "BAIXA")
+                    intervalo = None if self.ultimo_pulso_ts <= 0 else agora - self.ultimo_pulso_ts
+                    self.ultimo_pulso_ts = agora
+                    self.logs.appendleft({
+                        "pulso": self.pulsos,
+                        "timestamp": round(agora, 3),
+                        "score": round(float(score), 2),
+                        "confidence": round(float(confidence), 1),
+                        "quality": quality,
+                        "intervalo_s": None if intervalo is None else round(intervalo, 3),
+                    })
+                    intervalos_validos = [x["intervalo_s"] for x in self.logs if x["intervalo_s"] is not None]
+                    if intervalos_validos:
+                        self.intervalo_medio = round(float(np.mean(intervalos_validos)), 3)
+                self.estado = "OFF"
+                self.ultima_transicao_ts = agora
+        return {
+            "estado": self.estado,
+            "pulsos": self.pulsos,
+            "pulso_confirmado": pulso_confirmado,
+            "quality": quality,
+            "intervalo_medio": self.intervalo_medio,
+            "logs": list(self.logs),
+        }
 
-        if (
-            estado_atual == "ON"
-            and self.estado_anterior == "OFF"
-            and (agora - self.ultimo_pulso) > self.debounce
-        ):
-            self.pulsos += 1
-            self.ultimo_pulso = agora
-
-        self.estado_anterior = estado_atual
-        return estado_atual, self.pulsos
-
-
-st.title("🔴 Pulse Detector Vision")
-st.caption("Detector focado só em LED: câmera, ROI, OFF/ON, histerese, debounce, pulso em tempo real e bip.")
+st.title("🔴 Pulse Counter Vision")
+st.caption("Foco total na contagem de pulsos: ROI, OFF/ON, histerese, debounce e ciclo OFF→ON→OFF.")
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -94,15 +111,7 @@ with h2:
 with h3:
     threshold_margin = st.slider("Ajuste fino", -50.0, 50.0, 0.0, 0.5)
 
-b1, b2, b3 = st.columns(3)
-with b1:
-    st.session_state.beep_enabled = st.toggle("Bip por pulso", value=st.session_state.beep_enabled)
-with b2:
-    st.session_state.beep_freq = st.number_input("Frequência bip (Hz)", min_value=300, max_value=2000, value=int(st.session_state.beep_freq), step=10)
-with b3:
-    st.session_state.beep_ms = st.number_input("Duração bip (ms)", min_value=50, max_value=1000, value=int(st.session_state.beep_ms), step=10)
-
-st.info("Fluxo: START → aproximar LED → Salvar OFF → Salvar ON → observar OFF/ON, Pulsos e o bip.")
+st.info("Fluxo: START → aproximar LED → Salvar OFF → Salvar ON → observar pulsos confirmados.")
 
 ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
 twilio_cfg = st.secrets.get("twilio_turn", {})
@@ -119,14 +128,9 @@ else:
 
 rtc_configuration = {"iceServers": ice_servers}
 media_stream_constraints = {
-    "video": {
-        "facingMode": {"ideal": "environment"},
-        "width": {"ideal": 1280},
-        "height": {"ideal": 720},
-    },
+    "video": {"facingMode": {"ideal": "environment"}, "width": {"ideal": 1280}, "height": {"ideal": 720}},
     "audio": False,
 }
-
 
 @dataclass
 class DetectorConfig:
@@ -144,7 +148,6 @@ class DetectorConfig:
     detector_enabled: bool
     show_overlay: bool
 
-
 class PulseDetectorProcessor:
     def __init__(self, config: DetectorConfig):
         self.config = config
@@ -153,23 +156,17 @@ class PulseDetectorProcessor:
         self.brightness_buffer = deque(maxlen=max(1, int(config.smooth_window)))
         self.red_score_raw = None
         self.red_score_smooth = None
-        self.brightness_raw = None
+        self.brightness = None
         self.status = "NÃO ANALISADO"
         self.confidence = 0.0
         self.guidance = "Aguardando frames"
-        self.pulse_count = 0
         self.threshold_on = None
         self.threshold_off = None
         self.last_pulse_quality = "-"
         self.frame_counter = 0
-        self.pulse_events = deque(maxlen=100)
-        self.detector_state = "OFF"
-
-        self.detector_pulso = DetectorPulso(
-            limiar_on=30.0,
-            limiar_off=20.0,
-            debounce=float(config.debounce_ms) / 1000.0,
-        )
+        self.pulse_count = 0
+        self.intervalo_medio = None
+        self.contador = ContadorPulso(30.0, 20.0, float(config.debounce_ms)/1000.0, float(config.min_on_ms)/1000.0, float(config.min_off_ms)/1000.0)
 
     def _compute_thresholds(self):
         if self.config.calib_off is None or self.config.calib_on is None:
@@ -182,12 +179,13 @@ class PulseDetectorProcessor:
         return threshold_on, threshold_off
 
     def _compute_confidence(self, signal_value: float, brightness: float):
-        if self.threshold_on is None or self.threshold_off is None:
-            base = min(90.0, max(45.0, 50.0 + abs(signal_value - 20.0)))
-        else:
-            ref = self.threshold_on if self.status == "LED LIGADO" else self.threshold_off
-            distance = abs(signal_value - ref)
-            base = min(99.0, max(35.0, 45.0 + distance))
+        ref = 20.0
+        if self.status == "LED LIGADO" and self.threshold_on is not None:
+            ref = self.threshold_on
+        elif self.status == "LED DESLIGADO" and self.threshold_off is not None:
+            ref = self.threshold_off
+        distance = abs(signal_value - ref)
+        base = min(99.0, max(35.0, 45.0 + distance))
         if brightness < 20 or brightness > 240:
             base -= 20
         if len(self.red_buffer) >= 3:
@@ -234,22 +232,30 @@ class PulseDetectorProcessor:
         brightness_smooth = float(np.mean(np.array(self.brightness_buffer)))
 
         self.threshold_on, self.threshold_off = self._compute_thresholds()
+        limiar_on = self.threshold_on if self.threshold_on is not None else 30.0 + float(self.config.threshold_margin)
+        limiar_off = self.threshold_off if self.threshold_off is not None else 20.0 + float(self.config.threshold_margin)
 
-        if self.threshold_on is not None and self.threshold_off is not None:
-            self.detector_pulso.limiar_on = self.threshold_on
-            self.detector_pulso.limiar_off = self.threshold_off
+        visual_estado = self.contador.estado
+        if visual_estado == "OFF":
+            self.status = "LED LIGADO" if red_score_smooth >= limiar_on else "LED DESLIGADO"
         else:
-            self.detector_pulso.limiar_on = 30.0 + float(self.config.threshold_margin)
-            self.detector_pulso.limiar_off = 20.0 + float(self.config.threshold_margin)
-
-        self.detector_pulso.debounce = float(self.config.debounce_ms) / 1000.0
-
-        estado, pulsos = self.detector_pulso.atualizar(red_score_smooth)
-        self.pulse_count = pulsos
-        self.detector_state = estado
-        self.status = "LED LIGADO" if estado == "ON" else "LED DESLIGADO"
+            self.status = "LED DESLIGADO" if red_score_smooth <= limiar_off else "LED LIGADO"
 
         self.confidence = self._compute_confidence(red_score_smooth, brightness_smooth)
+
+        if self.config.detector_enabled:
+            self.contador.atualizar_parametros(
+                limiar_on=limiar_on,
+                limiar_off=limiar_off,
+                debounce_s=float(self.config.debounce_ms) / 1000.0,
+                min_on_s=float(self.config.min_on_ms) / 1000.0,
+                min_off_s=float(self.config.min_off_ms) / 1000.0,
+            )
+            result = self.contador.atualizar(red_score_smooth, self.confidence)
+            self.pulse_count = result["pulsos"]
+            self.intervalo_medio = result["intervalo_medio"]
+            if result["pulso_confirmado"]:
+                self.last_pulse_quality = result["quality"]
 
         if brightness_smooth < 20:
             self.guidance = "Imagem muito escura"
@@ -264,18 +270,8 @@ class PulseDetectorProcessor:
 
         self.red_score_raw = red_score
         self.red_score_smooth = red_score_smooth
-        self.brightness_raw = brightness_smooth
+        self.brightness = brightness_smooth
         self.frame_counter += 1
-
-        if len(self.pulse_events) == 0 or (self.pulse_events[0]["pulse"] != self.pulse_count and self.pulse_count > 0):
-            quality = "ALTA" if self.confidence >= 80 else ("MÉDIA" if self.confidence >= 60 else "BAIXA")
-            self.last_pulse_quality = quality
-            self.pulse_events.appendleft({
-                "t": round(time.time(), 3),
-                "pulse": self.pulse_count,
-                "quality": quality,
-                "score": round(float(self.red_score_smooth or 0.0), 2),
-            })
 
         if self.config.show_overlay:
             cv2.rectangle(crop, (rx1, ry1), (rx2, ry2), (0, 255, 0), 3)
@@ -293,13 +289,14 @@ class PulseDetectorProcessor:
                 "confidence": self.confidence,
                 "guidance": self.guidance,
                 "pulse_count": self.pulse_count,
-                "detector_state": self.detector_state,
+                "detector_state": self.contador.estado,
                 "threshold_on": self.threshold_on,
                 "threshold_off": self.threshold_off,
-                "brightness": self.brightness_raw,
+                "brightness": self.brightness,
                 "last_pulse_quality": self.last_pulse_quality,
-                "pulse_events": list(self.pulse_events),
+                "pulse_events": list(self.contador.logs),
                 "frame_counter": self.frame_counter,
+                "intervalo_medio": self.intervalo_medio,
             }
 
 config = DetectorConfig(
@@ -319,7 +316,7 @@ config = DetectorConfig(
 )
 
 ctx = webrtc_streamer(
-    key="pulse-detector-vision",
+    key="pulse-counter-vision",
     mode=WebRtcMode.SENDRECV,
     rtc_configuration=rtc_configuration,
     media_stream_constraints=media_stream_constraints,
@@ -328,31 +325,8 @@ ctx = webrtc_streamer(
 )
 
 left, right = st.columns([1.6, 1])
-
-def play_beep(freq: int, ms: int):
-    components.html(
-        f"""
-        <script>
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = {int(freq)};
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        gain.gain.value = 0.05;
-        osc.start();
-        setTimeout(() => {{
-            osc.stop();
-            ctx.close();
-        }}, {int(ms)});
-        </script>
-        """,
-        height=0,
-    )
-
 with right:
-    st.subheader("Painel do detector")
+    st.subheader("Painel do contador")
     b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("Salvar OFF", use_container_width=True):
@@ -373,7 +347,6 @@ with right:
             st.session_state.calib_off = None
             st.session_state.calib_on = None
             st.session_state.saved_message = "Calibração limpa."
-
     if st.session_state.saved_message:
         st.success(st.session_state.saved_message)
 
@@ -381,30 +354,23 @@ if ctx and ctx.state.playing and ctx.video_processor:
     metrics_ph = right.empty()
     info_ph = right.empty()
     events_ph = st.empty()
-
     while ctx.state.playing:
         snap = ctx.video_processor.get_snapshot()
         if snap["red_score_smooth"] is not None:
-            pulse_count = int(snap["pulse_count"])
-            if st.session_state.beep_enabled and pulse_count > st.session_state.last_announced_pulse:
-                st.session_state.last_announced_pulse = pulse_count
-                play_beep(int(st.session_state.beep_freq), int(st.session_state.beep_ms))
-
-            df = pd.DataFrame(
-                [
-                    {"Métrica": "Status", "Valor": snap["status"]},
-                    {"Métrica": "Red Score bruto", "Valor": round(float(snap["red_score_raw"]), 2)},
-                    {"Métrica": "Red Score médio", "Valor": round(float(snap["red_score_smooth"]), 2)},
-                    {"Métrica": "Confiança (%)", "Valor": round(float(snap["confidence"]), 1)},
-                    {"Métrica": "Pulsos", "Valor": snap["pulse_count"]},
-                    {"Métrica": "Estado detector", "Valor": snap["detector_state"]},
-                    {"Métrica": "Threshold ON", "Valor": None if snap["threshold_on"] is None else round(float(snap["threshold_on"]), 2)},
-                    {"Métrica": "Threshold OFF", "Valor": None if snap["threshold_off"] is None else round(float(snap["threshold_off"]), 2)},
-                    {"Métrica": "Brilho", "Valor": None if snap["brightness"] is None else round(float(snap["brightness"]), 2)},
-                    {"Métrica": "Qualidade último pulso", "Valor": snap["last_pulse_quality"]},
-                    {"Métrica": "Frames", "Valor": snap["frame_counter"]},
-                ]
-            )
+            df = pd.DataFrame([
+                {"Métrica": "Status", "Valor": snap["status"]},
+                {"Métrica": "Red Score bruto", "Valor": round(float(snap["red_score_raw"]), 2)},
+                {"Métrica": "Red Score médio", "Valor": round(float(snap["red_score_smooth"]), 2)},
+                {"Métrica": "Confiança (%)", "Valor": round(float(snap["confidence"]), 1)},
+                {"Métrica": "Pulsos", "Valor": snap["pulse_count"]},
+                {"Métrica": "Estado detector", "Valor": snap["detector_state"]},
+                {"Métrica": "Threshold ON", "Valor": None if snap["threshold_on"] is None else round(float(snap["threshold_on"]), 2)},
+                {"Métrica": "Threshold OFF", "Valor": None if snap["threshold_off"] is None else round(float(snap["threshold_off"]), 2)},
+                {"Métrica": "Brilho", "Valor": None if snap["brightness"] is None else round(float(snap["brightness"]), 2)},
+                {"Métrica": "Qualidade último pulso", "Valor": snap["last_pulse_quality"]},
+                {"Métrica": "Intervalo médio (s)", "Valor": snap["intervalo_medio"]},
+                {"Métrica": "Frames", "Valor": snap["frame_counter"]},
+            ])
             metrics_ph.dataframe(df, use_container_width=True, hide_index=True)
             info_ph.info(snap["guidance"])
             if snap["pulse_events"]:
@@ -415,4 +381,4 @@ else:
         st.info("Clique em START para abrir a câmera ao vivo.")
 
 st.markdown("### Observação")
-st.caption("Integração feita com a sua lógica base de DetectorPulso + bip por pulso. Próxima fase: plugar isso no v5.")
+st.caption("Agora a prioridade é contagem de pulsos robusta. Depois ajustamos o bip e plugamos no v5.")
