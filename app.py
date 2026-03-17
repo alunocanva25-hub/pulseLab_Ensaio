@@ -45,7 +45,6 @@ for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-
 # =============================================================================
 # CONTADOR DE PULSO
 # =============================================================================
@@ -90,24 +89,18 @@ class ContadorPulso:
                 self.ultima_transicao_ts = agora
 
         elif self.estado == "ON":
-            tempo_on = agora - self.ultima_transicao_ts
             if score <= self.limiar_off:
-                if tempo_on >= self.min_on_s and (agora - self.ultimo_pulso_ts) >= self.debounce_s:
+                tempo_on = agora - self.ultima_transicao_ts
+                tempo_desde_ultimo = agora - self.ultimo_pulso_ts
+
+                if tempo_on >= self.min_on_s and tempo_desde_ultimo >= self.debounce_s:
                     self.pulsos += 1
                     pulso_confirmado = True
 
-                    if confidence >= 80:
-                        quality = "ALTA"
-                    elif confidence >= 60:
-                        quality = "MÉDIA"
-                    else:
-                        quality = "BAIXA"
-
-                    intervalo = None
-                    if self.ultimo_pulso_ts > 0:
-                        intervalo = agora - self.ultimo_pulso_ts
-
+                    quality = "ALTA" if confidence >= 80 else "MÉDIA" if confidence >= 60 else "BAIXA"
+                    intervalo = agora - self.ultimo_pulso_ts if self.ultimo_pulso_ts > 0 else None
                     self.ultimo_pulso_ts = agora
+
                     self.logs.appendleft(
                         {
                             "pulso": self.pulsos,
@@ -115,13 +108,13 @@ class ContadorPulso:
                             "score": round(float(score), 2),
                             "confidence": round(float(confidence), 1),
                             "quality": quality,
-                            "intervalo_s": None if intervalo is None else round(intervalo, 3),
+                            "intervalo_s": round(intervalo, 3) if intervalo else None,
                         }
                     )
 
-                    intervalos_validos = [x["intervalo_s"] for x in self.logs if x["intervalo_s"] is not None]
-                    if intervalos_validos:
-                        self.intervalo_medio = round(float(np.mean(intervalos_validos)), 3)
+                    ivs = [x["intervalo_s"] for x in self.logs if x["intervalo_s"] is not None]
+                    if ivs:
+                        self.intervalo_medio = round(float(np.mean(ivs)), 3)
 
                 self.estado = "OFF"
                 self.ultima_transicao_ts = agora
@@ -134,7 +127,6 @@ class ContadorPulso:
             "intervalo_medio": self.intervalo_medio,
             "logs": list(self.logs),
         }
-
 
 # =============================================================================
 # TURN / WEBRTC
@@ -158,7 +150,6 @@ media_stream_constraints = {
     },
     "audio": False,
 }
-
 
 # =============================================================================
 # PROCESSADOR AO VIVO
@@ -185,13 +176,13 @@ class PulseDetectorProcessor:
         self.config = config
         self.lock = threading.Lock()
 
-        self.red_buffer = deque(maxlen=max(1, int(config.smooth_window)))
-        self.brightness_buffer = deque(maxlen=max(1, int(config.smooth_window)))
+        self.score_buffer = deque(maxlen=max(1, int(config.smooth_window)))
+        self.history = deque(maxlen=150)
 
-        self.red_score_raw = None
-        self.red_score_smooth = None
-        self.brightness = None
-        self.status = "NÃO ANALISADO"
+        self.red_score_raw = 0.0
+        self.red_score_smooth = 0.0
+        self.brightness = 128.0
+        self.status = "AGUARDANDO"
         self.confidence = 0.0
         self.guidance = "Aguardando frames"
         self.threshold_on = None
@@ -200,138 +191,220 @@ class PulseDetectorProcessor:
         self.last_pulse_quality = "-"
         self.pulse_count = 0
         self.intervalo_medio = None
+        self.best_target_area = None
+        self.best_target_score = None
 
         self.contador = ContadorPulso(
-            limiar_on=30.0,
-            limiar_off=20.0,
+            limiar_on=15.0,
+            limiar_off=5.0,
             debounce_s=float(config.debounce_ms) / 1000.0,
             min_on_s=float(config.min_on_ms) / 1000.0,
             min_off_s=float(config.min_off_ms) / 1000.0,
         )
 
+    def _score_contorno_led(self, cnt, hsv, roi_w, roi_h):
+        area = cv2.contourArea(cnt)
+        if area < 6 or area > 1200:
+            return None
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        cx = x + (w / 2.0)
+        cy = y + (h / 2.0)
+
+        centro_x = roi_w / 2.0
+        centro_y = roi_h / 2.0
+        dist = ((cx - centro_x) ** 2 + (cy - centro_y) ** 2) ** 0.5
+        dist_norm = dist / max(roi_w, roi_h)
+
+        local_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        cv2.drawContours(local_mask, [cnt], -1, 255, -1)
+
+        brilho = cv2.mean(hsv[:, :, 2], mask=local_mask)[0]
+        saturacao = cv2.mean(hsv[:, :, 1], mask=local_mask)[0]
+
+        perimetro = cv2.arcLength(cnt, True)
+        circularidade = 0.0
+        if perimetro > 0:
+            circularidade = (4 * np.pi * area) / (perimetro * perimetro)
+
+        score = (
+            (area * 0.20)
+            + (brilho * 0.35)
+            + (saturacao * 0.30)
+            + (circularidade * 30.0)
+            - (dist_norm * 80.0)
+        )
+
+        return {
+            "score": score,
+            "area": area,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "cx": cx,
+            "cy": cy,
+            "brilho": brilho,
+            "saturacao": saturacao,
+            "circularidade": circularidade,
+            "mask": local_mask,
+        }
+
+    def _detectar_alvo_led_hsv(self, roi_bgr):
+        hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+
+        m1 = cv2.inRange(hsv, np.array([0, 120, 120]), np.array([12, 255, 255]))
+        m2 = cv2.inRange(hsv, np.array([165, 120, 120]), np.array([180, 255, 255]))
+        mask = cv2.add(m1, m2)
+
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        roi_h, roi_w = mask.shape[:2]
+        melhor = None
+        melhor_score = -1e9
+
+        for cnt in contours:
+            cand = self._score_contorno_led(cnt, hsv, roi_w, roi_h)
+            if cand is None:
+                continue
+            if cand["score"] > melhor_score:
+                melhor_score = cand["score"]
+                melhor = cand
+
+        return melhor, mask, hsv
+
     def _compute_thresholds(self):
-        if self.config.calib_off is None or self.config.calib_on is None:
-            return None, None
-        off = float(self.config.calib_off)
-        on = float(self.config.calib_on)
-        delta = on - off
-        threshold_on = off + (delta * float(self.config.on_ratio)) + float(self.config.threshold_margin)
-        threshold_off = off + (delta * float(self.config.off_ratio)) + float(self.config.threshold_margin)
-        return threshold_on, threshold_off
+        if self.config.calib_on is not None and self.config.calib_off is not None:
+            off = float(self.config.calib_off)
+            on = float(self.config.calib_on)
+            diff = on - off
+            threshold_on = off + (diff * float(self.config.on_ratio)) + float(self.config.threshold_margin)
+            threshold_off = off + (diff * float(self.config.off_ratio)) + float(self.config.threshold_margin)
+            return threshold_on, threshold_off
 
-    def _compute_confidence(self, signal_value: float, brightness: float):
-        ref = 20.0
-        if self.status == "LED LIGADO" and self.threshold_on is not None:
-            ref = self.threshold_on
-        elif self.status == "LED DESLIGADO" and self.threshold_off is not None:
-            ref = self.threshold_off
+        if len(self.history) > 30:
+            v_min = float(np.min(self.history))
+            v_max = float(np.max(self.history))
+            diff = v_max - v_min
+            threshold_on = v_min + (diff * float(self.config.on_ratio)) + float(self.config.threshold_margin)
+            threshold_off = v_min + (diff * float(self.config.off_ratio)) + float(self.config.threshold_margin)
+            return threshold_on, threshold_off
 
-        distance = abs(signal_value - ref)
-        base = min(99.0, max(35.0, 45.0 + distance))
+        return 15.0 + float(self.config.threshold_margin), 5.0 + float(self.config.threshold_margin)
 
-        if brightness < 20 or brightness > 240:
-            base -= 20
-
-        if len(self.red_buffer) >= 3:
-            std = float(np.std(np.array(self.red_buffer)))
-            if std > 25:
-                base -= 12
-            elif std > 15:
-                base -= 6
-
-        return max(0.0, min(99.0, base))
+    def _compute_confidence(self):
+        if len(self.history) > 10:
+            v_min = float(np.min(self.history))
+            v_max = float(np.max(self.history))
+            return min(99.0, max(35.0, (v_max - v_min) * 5.0))
+        return 50.0
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
 
         zoom = max(1.0, float(self.config.zoom_digital))
-        crop_w = max(20, int(w / zoom))
-        crop_h = max(20, int(h / zoom))
-        cx, cy = w // 2, h // 2
-        x1 = max(0, cx - crop_w // 2)
-        y1 = max(0, cy - crop_h // 2)
-        x2 = min(w, x1 + crop_w)
-        y2 = min(h, y1 + crop_h)
-        crop = img[y1:y2, x1:x2].copy()
+        cw, ch = int(w / zoom), int(h / zoom)
+        x1, y1 = (w - cw) // 2, (h - ch) // 2
+        crop = img[y1:y1 + ch, x1:x1 + cw].copy()
 
-        ch, cw = crop.shape[:2]
-        roi_w = max(8, int(cw * float(self.config.roi_size)))
-        roi_h = max(8, int(ch * float(self.config.roi_size)))
-        rx1 = max(0, cw // 2 - roi_w // 2)
-        ry1 = max(0, ch // 2 - roi_h // 2)
-        rx2 = min(cw, rx1 + roi_w)
-        ry2 = min(ch, ry1 + roi_h)
-        roi = crop[ry1:ry2, rx1:rx2]
+        rh, rw = crop.shape[:2]
+        sw, sh = int(rw * self.config.roi_size), int(rh * self.config.roi_size)
+        rx, ry = (rw - sw) // 2, (rh - sh) // 2
+        roi = crop[ry:ry + sh, rx:rx + sw]
 
+        # fallback antigo
         roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        r = float(np.mean(roi_rgb[:, :, 0]))
-        g = float(np.mean(roi_rgb[:, :, 1]))
-        b = float(np.mean(roi_rgb[:, :, 2]))
-        brightness = float(np.mean(roi_rgb))
-        red_score = r - ((g + b) / 2.0)
+        r_full = float(np.mean(roi_rgb[:, :, 0]))
+        g_full = float(np.mean(roi_rgb[:, :, 1]))
+        b_full = float(np.mean(roi_rgb[:, :, 2]))
+        brightness_full = float(np.mean(roi_rgb))
+        red_score_full = r_full - ((g_full + b_full) / 2.0)
 
-        self.red_buffer.append(red_score)
-        self.brightness_buffer.append(brightness)
+        # novo detector HSV + alvo central
+        melhor_alvo, mask_hsv, hsv = self._detectar_alvo_led_hsv(roi)
 
-        red_score_smooth = float(np.mean(np.array(self.red_buffer)))
-        brightness_smooth = float(np.mean(np.array(self.brightness_buffer)))
+        if melhor_alvo is not None:
+            local_mask = melhor_alvo["mask"]
+
+            r_led = cv2.mean(roi_rgb[:, :, 0], mask=local_mask)[0]
+            g_led = cv2.mean(roi_rgb[:, :, 1], mask=local_mask)[0]
+            b_led = cv2.mean(roi_rgb[:, :, 2], mask=local_mask)[0]
+
+            red_score_led = float(r_led - ((g_led + b_led) / 2.0))
+            brightness_led = float(melhor_alvo["brilho"])
+
+            raw_score = (red_score_led * 0.75) + (red_score_full * 0.25)
+            brightness = (brightness_led * 0.70) + (brightness_full * 0.30)
+
+            self.guidance = "LED alvo encontrado"
+            self.best_target_area = round(float(melhor_alvo["area"]), 2)
+            self.best_target_score = round(float(melhor_alvo["score"]), 2)
+        else:
+            # fallback seguro
+            raw_score = red_score_full
+            brightness = brightness_full
+            self.guidance = "Sem alvo LED claro - usando fallback"
+            self.best_target_area = None
+            self.best_target_score = None
+
+        self.score_buffer.append(raw_score)
+        smooth_score = float(np.mean(self.score_buffer))
+        self.history.append(smooth_score)
 
         self.threshold_on, self.threshold_off = self._compute_thresholds()
 
-        limiar_on = self.threshold_on if self.threshold_on is not None else 30.0 + float(self.config.threshold_margin)
-        limiar_off = self.threshold_off if self.threshold_off is not None else 20.0 + float(self.config.threshold_margin)
-
-        visual_estado = self.contador.estado
-        if visual_estado == "OFF":
-            self.status = "LED LIGADO" if red_score_smooth >= limiar_on else "LED DESLIGADO"
-        else:
-            self.status = "LED DESLIGADO" if red_score_smooth <= limiar_off else "LED LIGADO"
-
-        self.confidence = self._compute_confidence(red_score_smooth, brightness_smooth)
-
         if self.config.detector_enabled:
             self.contador.atualizar_parametros(
-                limiar_on=limiar_on,
-                limiar_off=limiar_off,
-                debounce_s=float(self.config.debounce_ms) / 1000.0,
-                min_on_s=float(self.config.min_on_ms) / 1000.0,
-                min_off_s=float(self.config.min_off_ms) / 1000.0,
+                self.threshold_on,
+                self.threshold_off,
+                float(self.config.debounce_ms) / 1000.0,
+                float(self.config.min_on_ms) / 1000.0,
+                float(self.config.min_off_ms) / 1000.0,
             )
-            result = self.contador.atualizar(red_score_smooth, self.confidence)
-            self.pulse_count = result["pulsos"]
-            self.intervalo_medio = result["intervalo_medio"]
-            if result["pulso_confirmado"]:
-                self.last_pulse_quality = result["quality"]
 
-        if brightness_smooth < 20:
-            self.guidance = "Imagem escura"
-        elif brightness_smooth > 240:
-            self.guidance = "Imagem estourada"
-        elif self.confidence < 60:
-            self.guidance = "Baixa confiança"
-        elif self.confidence < 75:
-            self.guidance = "Confiança média"
-        else:
-            self.guidance = "Captura boa"
+        self.confidence = self._compute_confidence()
 
-        self.red_score_raw = red_score
-        self.red_score_smooth = red_score_smooth
-        self.brightness = brightness_smooth
+        res = self.contador.atualizar(smooth_score, self.confidence)
+        self.pulse_count = res["pulsos"]
+        self.status = "LED ON" if res["estado"] == "ON" else "LED OFF"
+        if res["pulso_confirmado"]:
+            self.last_pulse_quality = res["quality"]
+        self.intervalo_medio = res["intervalo_medio"]
+
+        self.red_score_raw = raw_score
+        self.red_score_smooth = smooth_score
+        self.brightness = brightness
         self.frame_counter += 1
 
+        if brightness < 20:
+            self.guidance = "Imagem escura"
+        elif brightness > 240:
+            self.guidance = "Imagem estourada"
+
         if self.config.show_overlay:
-            cv2.rectangle(crop, (rx1, ry1), (rx2, ry2), (0, 255, 0), 3)
-            overlay = f"{self.status} | P:{self.pulse_count}"
+            cv2.circle(crop, (rw // 2, rh // 2), 5, (0, 255, 0), 1)
+            cv2.rectangle(crop, (rx, ry), (rx + sw, ry + sh), (0, 255, 255), 2)
+
+            if melhor_alvo is not None:
+                ax = rx + int(melhor_alvo["x"])
+                ay = ry + int(melhor_alvo["y"])
+                aw = int(melhor_alvo["w"])
+                ah = int(melhor_alvo["h"])
+                cv2.rectangle(crop, (ax, ay), (ax + aw, ay + ah), (0, 0, 255), 2)
+
             cv2.putText(
                 crop,
-                overlay,
-                (10, 28),
+                f"{self.status} P:{self.pulse_count}",
+                (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                (0, 255, 255),
+                0.7,
+                (0, 255, 0),
                 2,
-                cv2.LINE_AA,
             )
 
         return av.VideoFrame.from_ndarray(crop, format="bgr24")
@@ -345,7 +418,6 @@ class PulseDetectorProcessor:
                 "confidence": self.confidence,
                 "guidance": self.guidance,
                 "pulse_count": self.pulse_count,
-                "detector_state": self.contador.estado,
                 "threshold_on": self.threshold_on,
                 "threshold_off": self.threshold_off,
                 "brightness": self.brightness,
@@ -353,8 +425,9 @@ class PulseDetectorProcessor:
                 "pulse_events": list(self.contador.logs),
                 "frame_counter": self.frame_counter,
                 "intervalo_medio": self.intervalo_medio,
+                "best_target_area": self.best_target_area,
+                "best_target_score": self.best_target_score,
             }
-
 
 # =============================================================================
 # CSS
@@ -391,13 +464,6 @@ st.markdown("""
     font-weight: 800;
     border-radius: 14px;
 }
-.icon-btn .stButton > button {
-    width: 100%;
-    min-height: 42px;
-    border-radius: 12px;
-    font-size: 1.1rem;
-    font-weight: 800;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -430,9 +496,21 @@ if not st.session_state.ensaio_iniciado:
         idx_modo = modos.index(st.session_state.tipo_deteccao) if st.session_state.tipo_deteccao in modos else 0
         st.session_state.tipo_deteccao = st.selectbox("Tipo de ensaio", modos, index=idx_modo)
     with cfg2:
-        st.session_state.tempo_ensaio_s = st.number_input("Tempo do ensaio (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_ensaio_s), step=1)
+        st.session_state.tempo_ensaio_s = st.number_input(
+            "Tempo do ensaio (s)",
+            min_value=1,
+            max_value=3600,
+            value=int(st.session_state.tempo_ensaio_s),
+            step=1,
+        )
     with cfg3:
-        st.session_state.meta_pulsos = st.number_input("Meta de pulsos", min_value=1, max_value=9999, value=int(st.session_state.meta_pulsos), step=1)
+        st.session_state.meta_pulsos = st.number_input(
+            "Meta de pulsos",
+            min_value=1,
+            max_value=9999,
+            value=int(st.session_state.meta_pulsos),
+            step=1,
+        )
     with cfg4:
         constantes_fmt = [f"{v:.3f}" for v in CONSTANTES_KDKH]
         valor_atual = f"{float(st.session_state.constante_kh):.3f}"
@@ -446,7 +524,13 @@ if not st.session_state.ensaio_iniciado:
         idx_classe = classes.index(st.session_state.classe_medidor) if st.session_state.classe_medidor in classes else 1
         st.session_state.classe_medidor = st.selectbox("Classe do medidor", classes, index=idx_classe)
     with cfg6:
-        st.session_state.verificacao_led_seg = st.number_input("Verificação detector (s)", min_value=1, max_value=30, value=int(st.session_state.verificacao_led_seg), step=1)
+        st.session_state.verificacao_led_seg = st.number_input(
+            "Verificação detector (s)",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.verificacao_led_seg),
+            step=1,
+        )
     with cfg7:
         if st.button("Abrir modo captura", use_container_width=True):
             st.session_state.modo_tela = "captura"
@@ -630,6 +714,8 @@ if st.session_state.modo_tela == "captura":
                         {"Métrica": "Threshold OFF", "Valor": None if snap["threshold_off"] is None else round(float(snap["threshold_off"]), 2)},
                         {"Métrica": "Qualidade último pulso", "Valor": snap["last_pulse_quality"]},
                         {"Métrica": "Intervalo médio (s)", "Valor": snap["intervalo_medio"]},
+                        {"Métrica": "Alvo área", "Valor": snap["best_target_area"]},
+                        {"Métrica": "Alvo score", "Valor": snap["best_target_score"]},
                     ]
                 )
                 st.dataframe(df, use_container_width=True, hide_index=True)
@@ -682,6 +768,8 @@ else:
                     {"Métrica": "Score", "Valor": round(float(s["red_score_smooth"]), 2)},
                     {"Métrica": "Pulsos", "Valor": s["pulse_count"]},
                     {"Métrica": "Confiança (%)", "Valor": round(float(s["confidence"]), 1)},
+                    {"Métrica": "Alvo área", "Valor": s["best_target_area"]},
+                    {"Métrica": "Alvo score", "Valor": s["best_target_score"]},
                 ]
             )
             st.dataframe(df, use_container_width=True, hide_index=True)
