@@ -18,6 +18,12 @@ st.set_page_config(page_title="PulseLab - Ensaio", page_icon="🔴", layout="wid
 # =============================================================================
 # ESTADO
 # =============================================================================
+CONSTANTES_KDKH = [
+    0.100, 0.200, 0.300, 0.400, 0.500, 0.600, 0.625, 0.900, 0.960,
+    1.000, 1.250, 1.500, 1.800, 2.000, 2.400, 2.800, 3.000, 3.125,
+    3.600, 4.800, 5.400, 6.250, 7.200, 8.000, 9.600, 10.800, 21.600
+]
+
 DEFAULTS = {
     "modo_tela": "config_ensaio",   # config_ensaio | captura
     "tipo_deteccao": "Manual",      # Manual | LED | Tarja
@@ -28,11 +34,12 @@ DEFAULTS = {
     "ensaio_inicio_ts": None,
     "meta_pulsos": 10,
     "classe_medidor": "B (1%)",
-    "constante_kh": 3.6,
+    "constante_kh": 3.600,
     "detector_verificado": False,
     "verificacao_led_seg": 3,
     "mostrar_painel_debug": False,
     "pulsos_manuais": 0,
+    "ensaio_iniciado": False,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -298,9 +305,9 @@ class PulseDetectorProcessor:
                 self.last_pulse_quality = result["quality"]
 
         if brightness_smooth < 20:
-            self.guidance = "Imagem muito escura"
+            self.guidance = "Imagem escura"
         elif brightness_smooth > 240:
-            self.guidance = "Imagem muito clara / estourada"
+            self.guidance = "Imagem estourada"
         elif self.confidence < 60:
             self.guidance = "Baixa confiança"
         elif self.confidence < 75:
@@ -315,7 +322,7 @@ class PulseDetectorProcessor:
 
         if self.config.show_overlay:
             cv2.rectangle(crop, (rx1, ry1), (rx2, ry2), (0, 255, 0), 3)
-            overlay = f"{self.status} | P:{self.pulse_count} | C:{self.confidence:.0f}%"
+            overlay = f"{self.status} | P:{self.pulse_count}"
             cv2.putText(
                 crop,
                 overlay,
@@ -354,7 +361,7 @@ class PulseDetectorProcessor:
 # =============================================================================
 st.markdown("""
 <style>
-.block-container {padding-top: 0.5rem; padding-bottom: 1rem;}
+.block-container {padding-top: 0.4rem; padding-bottom: 1rem;}
 .top-strip {
     background: #111;
     color: #f7ea1c;
@@ -362,7 +369,7 @@ st.markdown("""
     padding: 10px 12px;
     margin-bottom: 10px;
     font-weight: 800;
-    font-size: 0.92rem;
+    font-size: 0.90rem;
 }
 .ensaio-toolbar {
     background: #f3f6fb;
@@ -383,6 +390,13 @@ st.markdown("""
     min-height: 54px;
     font-weight: 800;
     border-radius: 14px;
+}
+.icon-btn .stButton > button {
+    width: 100%;
+    min-height: 42px;
+    border-radius: 12px;
+    font-size: 1.1rem;
+    font-weight: 800;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -405,44 +419,49 @@ with st.sidebar:
     threshold_margin = st.slider("Ajuste fino", -50.0, 50.0, 0.0, 0.5)
 
 # =============================================================================
-# CONFIG ENSAIO
+# TOPO CONFIG ENSAIO
 # =============================================================================
 st.title("PulseLab - Ensaio")
 
-cfg1, cfg2, cfg3, cfg4 = st.columns(4)
-with cfg1:
-    modos = ["Manual", "LED", "Tarja"]
-    idx_modo = modos.index(st.session_state.tipo_deteccao) if st.session_state.tipo_deteccao in modos else 0
-    st.session_state.tipo_deteccao = st.selectbox("Tipo de ensaio", modos, index=idx_modo)
-with cfg2:
-    st.session_state.tempo_ensaio_s = st.number_input("Tempo do ensaio (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_ensaio_s), step=1)
-with cfg3:
-    st.session_state.meta_pulsos = st.number_input("Meta de pulsos", min_value=1, max_value=9999, value=int(st.session_state.meta_pulsos), step=1)
-with cfg4:
-    if st.button("Abrir modo captura", use_container_width=True):
-        st.session_state.modo_tela = "captura"
-        if st.session_state.ensaio_inicio_ts is None:
-            st.session_state.ensaio_inicio_ts = time.time()
-        st.rerun()
+if not st.session_state.ensaio_iniciado:
+    cfg1, cfg2, cfg3, cfg4 = st.columns(4)
+    with cfg1:
+        modos = ["Manual", "LED", "Tarja"]
+        idx_modo = modos.index(st.session_state.tipo_deteccao) if st.session_state.tipo_deteccao in modos else 0
+        st.session_state.tipo_deteccao = st.selectbox("Tipo de ensaio", modos, index=idx_modo)
+    with cfg2:
+        st.session_state.tempo_ensaio_s = st.number_input("Tempo do ensaio (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_ensaio_s), step=1)
+    with cfg3:
+        st.session_state.meta_pulsos = st.number_input("Meta de pulsos", min_value=1, max_value=9999, value=int(st.session_state.meta_pulsos), step=1)
+    with cfg4:
+        constantes_fmt = [f"{v:.3f}" for v in CONSTANTES_KDKH]
+        valor_atual = f"{float(st.session_state.constante_kh):.3f}"
+        idx_const = constantes_fmt.index(valor_atual) if valor_atual in constantes_fmt else constantes_fmt.index("3.600")
+        selecionada = st.selectbox("Constante Kh/Kd", constantes_fmt, index=idx_const)
+        st.session_state.constante_kh = float(selecionada)
 
-cfg5, cfg6, cfg7 = st.columns(3)
-with cfg5:
-    classes = ["A (2%)", "B (1%)", "C (0,5%)", "D (0,2%)"]
-    idx_classe = classes.index(st.session_state.classe_medidor) if st.session_state.classe_medidor in classes else 1
-    st.session_state.classe_medidor = st.selectbox("Classe do medidor", classes, index=idx_classe)
-with cfg6:
-    st.session_state.constante_kh = st.number_input("Constante Kh/Kd", min_value=0.001, value=float(st.session_state.constante_kh), step=0.001, format="%.3f")
-with cfg7:
-    st.session_state.verificacao_led_seg = st.number_input("Verificação detector (s)", min_value=1, max_value=30, value=int(st.session_state.verificacao_led_seg), step=1)
+    cfg5, cfg6, cfg7, cfg8 = st.columns(4)
+    with cfg5:
+        classes = ["A (2%)", "B (1%)", "C (0,5%)", "D (0,2%)"]
+        idx_classe = classes.index(st.session_state.classe_medidor) if st.session_state.classe_medidor in classes else 1
+        st.session_state.classe_medidor = st.selectbox("Classe do medidor", classes, index=idx_classe)
+    with cfg6:
+        st.session_state.verificacao_led_seg = st.number_input("Verificação detector (s)", min_value=1, max_value=30, value=int(st.session_state.verificacao_led_seg), step=1)
+    with cfg7:
+        if st.button("Abrir modo captura", use_container_width=True):
+            st.session_state.modo_tela = "captura"
+            st.rerun()
+    with cfg8:
+        st.empty()
 
-bar_text = (
-    f"Tipo: {st.session_state.tipo_deteccao} | "
-    f"Classe: {st.session_state.classe_medidor} | "
-    f"Kh/Kd: {st.session_state.constante_kh:.3f} | "
-    f"Tempo: {st.session_state.tempo_ensaio_s}s | "
-    f"Meta: {st.session_state.meta_pulsos}"
-)
-st.markdown(f'<div class="ensaio-toolbar"><b>Configuração do ensaio:</b> {bar_text}</div>', unsafe_allow_html=True)
+    bar_text = (
+        f"Tipo: {st.session_state.tipo_deteccao} | "
+        f"Classe: {st.session_state.classe_medidor} | "
+        f"Kh/Kd: {st.session_state.constante_kh:.3f} | "
+        f"Tempo: {st.session_state.tempo_ensaio_s}s | "
+        f"Meta: {st.session_state.meta_pulsos}"
+    )
+    st.markdown(f'<div class="ensaio-toolbar"><b>Configuração do ensaio:</b> {bar_text}</div>', unsafe_allow_html=True)
 
 # =============================================================================
 # WEBRTC
@@ -473,28 +492,32 @@ ctx = webrtc_streamer(
 )
 
 # =============================================================================
-# CAPTURA
+# TELA CAPTURA
 # =============================================================================
 if st.session_state.modo_tela == "captura":
     if st.session_state.ensaio_inicio_ts is None:
         st.session_state.ensaio_inicio_ts = time.time()
 
-    tempo_decorrido = int(time.time() - st.session_state.ensaio_inicio_ts)
+    tempo_decorrido = int(time.time() - st.session_state.ensaio_inicio_ts) if st.session_state.ensaio_iniciado else 0
     tempo_restante = max(int(st.session_state.tempo_ensaio_s) - tempo_decorrido, 0)
 
     snap = None
     if ctx and ctx.video_processor:
         snap = ctx.video_processor.get_snapshot()
 
+    top_left, top_right = st.columns([10, 1])
+    with top_right:
+        if st.button("⚙️", help="Mostrar/ocultar calibração e diagnóstico"):
+            st.session_state.mostrar_painel_debug = not st.session_state.mostrar_painel_debug
+            st.rerun()
+
     if st.session_state.tipo_deteccao == "Manual":
         pulsos = int(st.session_state.pulsos_manuais)
-        st.markdown(
-            f'<div class="top-strip">MANUAL | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s</div>',
-            unsafe_allow_html=True
-        )
-
-        st.markdown("### Modo manual")
-        st.info("Neste modo não usa câmera. A contagem é feita nos botões + e -.")
+        with top_left:
+            st.markdown(
+                f'<div class="top-strip">MANUAL | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s</div>',
+                unsafe_allow_html=True
+            )
 
         st.markdown(
             f"""
@@ -507,9 +530,13 @@ if st.session_state.modo_tela == "captura":
             unsafe_allow_html=True
         )
 
+        st.info("Modo manual ativo. Use + e - para contagem.")
+
+        st.markdown('<div class="action-row">', unsafe_allow_html=True)
         a1, a2, a3, a4 = st.columns(4)
         with a1:
             if st.button("Iniciar", use_container_width=True):
+                st.session_state.ensaio_iniciado = True
                 if st.session_state.ensaio_inicio_ts is None:
                     st.session_state.ensaio_inicio_ts = time.time()
                 st.rerun()
@@ -517,6 +544,7 @@ if st.session_state.modo_tela == "captura":
             if st.button("Finalizar", use_container_width=True):
                 st.session_state.modo_tela = "config_ensaio"
                 st.session_state.ensaio_inicio_ts = None
+                st.session_state.ensaio_iniciado = False
                 st.rerun()
         with a3:
             if st.button("+", use_container_width=True):
@@ -527,25 +555,22 @@ if st.session_state.modo_tela == "captura":
                 if st.session_state.pulsos_manuais > 0:
                     st.session_state.pulsos_manuais -= 1
                 st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
     else:
         status = snap["status"] if snap and snap["status"] else "NÃO ANALISADO"
         score = f'{snap["red_score_smooth"]:.1f}' if snap and snap["red_score_smooth"] is not None else "-"
         pulsos = snap["pulse_count"] if snap else 0
 
-        st.markdown(
-            f'<div class="top-strip">{st.session_state.tipo_deteccao} | {status} | Score: {score} | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s</div>',
-            unsafe_allow_html=True
-        )
+        with top_left:
+            st.markdown(
+                f'<div class="top-strip">{st.session_state.tipo_deteccao} | {status} | Score: {score} | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s</div>',
+                unsafe_allow_html=True
+            )
 
         st.caption("Área principal de captura")
         if not (ctx and ctx.state.playing):
             st.info("Clique em START para abrir a câmera ao vivo.")
-
-        toggle_txt = "Ocultar calibração/diagnóstico" if st.session_state.mostrar_painel_debug else "Mostrar calibração/diagnóstico"
-        if st.button(toggle_txt, use_container_width=True):
-            st.session_state.mostrar_painel_debug = not st.session_state.mostrar_painel_debug
-            st.rerun()
 
         if st.session_state.mostrar_painel_debug:
             st.markdown('<div class="compact-box"><b>Calibrar / verificar detector</b></div>', unsafe_allow_html=True)
@@ -613,6 +638,7 @@ if st.session_state.modo_tela == "captura":
         a1, a2, a3, a4 = st.columns(4)
         with a1:
             if st.button("Iniciar", use_container_width=True):
+                st.session_state.ensaio_iniciado = True
                 if st.session_state.ensaio_inicio_ts is None:
                     st.session_state.ensaio_inicio_ts = time.time()
                 st.rerun()
@@ -620,6 +646,7 @@ if st.session_state.modo_tela == "captura":
             if st.button("Finalizar", use_container_width=True):
                 st.session_state.modo_tela = "config_ensaio"
                 st.session_state.ensaio_inicio_ts = None
+                st.session_state.ensaio_iniciado = False
                 st.rerun()
         with a3:
             if st.button("+", use_container_width=True):
@@ -629,14 +656,14 @@ if st.session_state.modo_tela == "captura":
                 st.info("Ajuste manual - reservado para integração.")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        if ctx and ctx.state.playing and ctx.video_processor:
+        if ctx and ctx.state.playing and ctx.video_processor and st.session_state.mostrar_painel_debug:
             logs = ctx.video_processor.get_snapshot().get("pulse_events", [])
-            if logs and st.session_state.mostrar_painel_debug:
+            if logs:
                 st.markdown("### Eventos de pulso")
                 st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
 
 # =============================================================================
-# CONFIG ENSAIO
+# TELA CONFIG
 # =============================================================================
 else:
     st.info(
