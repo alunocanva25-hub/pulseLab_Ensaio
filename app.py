@@ -195,8 +195,8 @@ class PulseDetectorProcessor:
         self.best_target_score = None
 
         self.contador = ContadorPulso(
-            limiar_on=15.0,
-            limiar_off=5.0,
+            limiar_on=9999.0,
+            limiar_off=9999.0,
             debounce_s=float(config.debounce_ms) / 1000.0,
             min_on_s=float(config.min_on_ms) / 1000.0,
             min_off_s=float(config.min_off_ms) / 1000.0,
@@ -282,6 +282,10 @@ class PulseDetectorProcessor:
             off = float(self.config.calib_off)
             on = float(self.config.calib_on)
             diff = on - off
+
+            if diff < 3:
+                return 9999.0, 9999.0
+
             threshold_on = off + (diff * float(self.config.on_ratio)) + float(self.config.threshold_margin)
             threshold_off = off + (diff * float(self.config.off_ratio)) + float(self.config.threshold_margin)
             return threshold_on, threshold_off
@@ -290,18 +294,28 @@ class PulseDetectorProcessor:
             v_min = float(np.min(self.history))
             v_max = float(np.max(self.history))
             diff = v_max - v_min
+
+            if diff < 3:
+                return 9999.0, 9999.0
+
             threshold_on = v_min + (diff * float(self.config.on_ratio)) + float(self.config.threshold_margin)
             threshold_off = v_min + (diff * float(self.config.off_ratio)) + float(self.config.threshold_margin)
             return threshold_on, threshold_off
 
-        return 15.0 + float(self.config.threshold_margin), 5.0 + float(self.config.threshold_margin)
+        return 9999.0, 9999.0
 
     def _compute_confidence(self):
         if len(self.history) > 10:
             v_min = float(np.min(self.history))
             v_max = float(np.max(self.history))
-            return min(99.0, max(35.0, (v_max - v_min) * 5.0))
-        return 50.0
+            conf = min(99.0, max(35.0, (v_max - v_min) * 5.0))
+        else:
+            conf = 50.0
+
+        if "LED alvo encontrado" not in str(self.guidance):
+            conf -= 10.0
+
+        return max(0.0, min(99.0, conf))
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
@@ -317,7 +331,7 @@ class PulseDetectorProcessor:
         rx, ry = (rw - sw) // 2, (rh - sh) // 2
         roi = crop[ry:ry + sh, rx:rx + sw]
 
-        # fallback antigo
+        # fallback anterior
         roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         r_full = float(np.mean(roi_rgb[:, :, 0]))
         g_full = float(np.mean(roi_rgb[:, :, 1]))
@@ -325,8 +339,9 @@ class PulseDetectorProcessor:
         brightness_full = float(np.mean(roi_rgb))
         red_score_full = r_full - ((g_full + b_full) / 2.0)
 
-        # novo detector HSV + alvo central
+        # detector novo
         melhor_alvo, mask_hsv, hsv = self._detectar_alvo_led_hsv(roi)
+        target_ok = False
 
         if melhor_alvo is not None:
             local_mask = melhor_alvo["mask"]
@@ -337,20 +352,30 @@ class PulseDetectorProcessor:
 
             red_score_led = float(r_led - ((g_led + b_led) / 2.0))
             brightness_led = float(melhor_alvo["brilho"])
+            saturacao_led = float(melhor_alvo["saturacao"])
+            area_led = float(melhor_alvo["area"])
 
-            raw_score = (red_score_led * 0.75) + (red_score_full * 0.25)
-            brightness = (brightness_led * 0.70) + (brightness_full * 0.30)
-
-            self.guidance = "LED alvo encontrado"
-            self.best_target_area = round(float(melhor_alvo["area"]), 2)
-            self.best_target_score = round(float(melhor_alvo["score"]), 2)
+            if area_led >= 8 and area_led <= 800 and brightness_led >= 140 and saturacao_led >= 140:
+                raw_score = (red_score_led * 0.75) + (red_score_full * 0.25)
+                brightness = (brightness_led * 0.70) + (brightness_full * 0.30)
+                self.guidance = "LED alvo encontrado"
+                self.best_target_area = round(area_led, 2)
+                self.best_target_score = round(float(melhor_alvo["score"]), 2)
+                target_ok = True
+            else:
+                raw_score = 0.0
+                brightness = brightness_full
+                self.guidance = "Alvo rejeitado - fraco ou fora do perfil LED"
+                self.best_target_area = round(area_led, 2)
+                self.best_target_score = round(float(melhor_alvo["score"]), 2)
+                target_ok = False
         else:
-            # fallback seguro
-            raw_score = red_score_full
+            raw_score = 0.0
             brightness = brightness_full
-            self.guidance = "Sem alvo LED claro - usando fallback"
+            self.guidance = "Sem alvo LED válido"
             self.best_target_area = None
             self.best_target_score = None
+            target_ok = False
 
         self.score_buffer.append(raw_score)
         smooth_score = float(np.mean(self.score_buffer))
@@ -369,7 +394,19 @@ class PulseDetectorProcessor:
 
         self.confidence = self._compute_confidence()
 
-        res = self.contador.atualizar(smooth_score, self.confidence)
+        if target_ok:
+            res = self.contador.atualizar(smooth_score, self.confidence)
+        else:
+            res = {
+                "estado": "OFF",
+                "pulsos": self.contador.pulsos,
+                "pulso_confirmado": False,
+                "quality": "-",
+                "intervalo_medio": self.contador.intervalo_medio,
+                "logs": list(self.contador.logs),
+            }
+            self.contador.estado = "OFF"
+
         self.pulse_count = res["pulsos"]
         self.status = "LED ON" if res["estado"] == "ON" else "LED OFF"
         if res["pulso_confirmado"]:
@@ -716,6 +753,7 @@ if st.session_state.modo_tela == "captura":
                         {"Métrica": "Intervalo médio (s)", "Valor": snap["intervalo_medio"]},
                         {"Métrica": "Alvo área", "Valor": snap["best_target_area"]},
                         {"Métrica": "Alvo score", "Valor": snap["best_target_score"]},
+                        {"Métrica": "Orientação", "Valor": snap["guidance"]},
                     ]
                 )
                 st.dataframe(df, use_container_width=True, hide_index=True)
@@ -770,6 +808,7 @@ else:
                     {"Métrica": "Confiança (%)", "Valor": round(float(s["confidence"]), 1)},
                     {"Métrica": "Alvo área", "Valor": s["best_target_area"]},
                     {"Métrica": "Alvo score", "Valor": s["best_target_score"]},
+                    {"Métrica": "Orientação", "Valor": s["guidance"]},
                 ]
             )
             st.dataframe(df, use_container_width=True, hide_index=True)
