@@ -13,14 +13,14 @@ import pandas as pd
 import streamlit as st
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-st.set_page_config(page_title="PulseLab - Ensaio LED/Tarja", page_icon="🔴", layout="wide")
+st.set_page_config(page_title="PulseLab - Ensaio", page_icon="🔴", layout="wide")
 
 # =============================================================================
 # ESTADO
 # =============================================================================
 DEFAULTS = {
     "modo_tela": "config_ensaio",   # config_ensaio | captura
-    "tipo_deteccao": "LED",         # LED | Tarja
+    "tipo_deteccao": "Manual",      # Manual | LED | Tarja
     "calib_off": None,
     "calib_on": None,
     "saved_message": "",
@@ -31,6 +31,8 @@ DEFAULTS = {
     "constante_kh": 3.6,
     "detector_verificado": False,
     "verificacao_led_seg": 3,
+    "mostrar_painel_debug": False,
+    "pulsos_manuais": 0,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -128,7 +130,7 @@ class ContadorPulso:
 
 
 # =============================================================================
-# CONFIG / TURN
+# TURN / WEBRTC
 # =============================================================================
 ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
 twilio_cfg = st.secrets.get("twilio_turn", {})
@@ -152,7 +154,7 @@ media_stream_constraints = {
 
 
 # =============================================================================
-# PROCESSADOR
+# PROCESSADOR AO VIVO
 # =============================================================================
 @dataclass
 class DetectorConfig:
@@ -300,9 +302,9 @@ class PulseDetectorProcessor:
         elif brightness_smooth > 240:
             self.guidance = "Imagem muito clara / estourada"
         elif self.confidence < 60:
-            self.guidance = "Baixa confiança - aproxime mais ou recalibre"
+            self.guidance = "Baixa confiança"
         elif self.confidence < 75:
-            self.guidance = "Confiança média - estabilize a câmera"
+            self.guidance = "Confiança média"
         else:
             self.guidance = "Captura boa"
 
@@ -313,16 +315,13 @@ class PulseDetectorProcessor:
 
         if self.config.show_overlay:
             cv2.rectangle(crop, (rx1, ry1), (rx2, ry2), (0, 255, 0), 3)
-            overlay = (
-                f"{self.status} | Score: {red_score_smooth:.1f} | "
-                f"Pulsos: {self.pulse_count} | Conf: {self.confidence:.0f}%"
-            )
+            overlay = f"{self.status} | P:{self.pulse_count} | C:{self.confidence:.0f}%"
             cv2.putText(
                 crop,
                 overlay,
-                (10, 30),
+                (10, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.52,
                 (0, 255, 255),
                 2,
                 cv2.LINE_AA,
@@ -355,15 +354,15 @@ class PulseDetectorProcessor:
 # =============================================================================
 st.markdown("""
 <style>
-.block-container {padding-top: 0.6rem; padding-bottom: 1rem;}
+.block-container {padding-top: 0.5rem; padding-bottom: 1rem;}
 .top-strip {
     background: #111;
-    color: #f4f000;
+    color: #f7ea1c;
     border-radius: 14px;
-    padding: 10px 14px;
+    padding: 10px 12px;
     margin-bottom: 10px;
     font-weight: 800;
-    font-size: 0.95rem;
+    font-size: 0.92rem;
 }
 .ensaio-toolbar {
     background: #f3f6fb;
@@ -372,12 +371,6 @@ st.markdown("""
     padding: 12px;
     margin-bottom: 10px;
 }
-.bottom-actions .stButton > button {
-    width: 100%;
-    min-height: 56px;
-    font-weight: 800;
-    border-radius: 14px;
-}
 .compact-box {
     background: #ffffff;
     border: 1px solid #e2e8f0;
@@ -385,11 +378,17 @@ st.markdown("""
     padding: 10px;
     margin-bottom: 8px;
 }
+.action-row .stButton > button {
+    width: 100%;
+    min-height: 54px;
+    font-weight: 800;
+    border-radius: 14px;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# CONFIG GERAL / ENSAIO
+# SIDEBAR = CONFIG GERAL
 # =============================================================================
 with st.sidebar:
     st.header("Configuração geral")
@@ -405,11 +404,16 @@ with st.sidebar:
     off_ratio = st.slider("Limiar OFF (%)", 0.05, 0.80, 0.35, 0.01)
     threshold_margin = st.slider("Ajuste fino", -50.0, 50.0, 0.0, 0.5)
 
+# =============================================================================
+# CONFIG ENSAIO
+# =============================================================================
 st.title("PulseLab - Ensaio")
 
 cfg1, cfg2, cfg3, cfg4 = st.columns(4)
 with cfg1:
-    st.session_state.tipo_deteccao = st.selectbox("Tipo de ensaio", ["LED", "Tarja"], index=0 if st.session_state.tipo_deteccao == "LED" else 1)
+    modos = ["Manual", "LED", "Tarja"]
+    idx_modo = modos.index(st.session_state.tipo_deteccao) if st.session_state.tipo_deteccao in modos else 0
+    st.session_state.tipo_deteccao = st.selectbox("Tipo de ensaio", modos, index=idx_modo)
 with cfg2:
     st.session_state.tempo_ensaio_s = st.number_input("Tempo do ensaio (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_ensaio_s), step=1)
 with cfg3:
@@ -423,11 +427,13 @@ with cfg4:
 
 cfg5, cfg6, cfg7 = st.columns(3)
 with cfg5:
-    st.session_state.classe_medidor = st.selectbox("Classe do medidor", ["A (2%)", "B (1%)", "C (0,5%)", "D (0,2%)"], index=["A (2%)", "B (1%)", "C (0,5%)", "D (0,2%)"].index(st.session_state.classe_medidor))
+    classes = ["A (2%)", "B (1%)", "C (0,5%)", "D (0,2%)"]
+    idx_classe = classes.index(st.session_state.classe_medidor) if st.session_state.classe_medidor in classes else 1
+    st.session_state.classe_medidor = st.selectbox("Classe do medidor", classes, index=idx_classe)
 with cfg6:
     st.session_state.constante_kh = st.number_input("Constante Kh/Kd", min_value=0.001, value=float(st.session_state.constante_kh), step=0.001, format="%.3f")
 with cfg7:
-    st.session_state.verificacao_led_seg = st.number_input("Verificação LED (s)", min_value=1, max_value=30, value=int(st.session_state.verificacao_led_seg), step=1)
+    st.session_state.verificacao_led_seg = st.number_input("Verificação detector (s)", min_value=1, max_value=30, value=int(st.session_state.verificacao_led_seg), step=1)
 
 bar_text = (
     f"Tipo: {st.session_state.tipo_deteccao} | "
@@ -441,23 +447,6 @@ st.markdown(f'<div class="ensaio-toolbar"><b>Configuração do ensaio:</b> {bar_
 # =============================================================================
 # WEBRTC
 # =============================================================================
-@dataclass
-class DetectorConfig:
-    zoom_digital: float
-    roi_size: float
-    calib_off: float | None
-    calib_on: float | None
-    threshold_margin: float
-    on_ratio: float
-    off_ratio: float
-    smooth_window: int
-    debounce_ms: int
-    min_on_ms: int
-    min_off_ms: int
-    detector_enabled: bool
-    show_overlay: bool
-
-
 config = DetectorConfig(
     zoom_digital=zoom_digital,
     roi_size=roi_size,
@@ -484,7 +473,7 @@ ctx = webrtc_streamer(
 )
 
 # =============================================================================
-# TELA CAPTURA
+# CAPTURA
 # =============================================================================
 if st.session_state.modo_tela == "captura":
     if st.session_state.ensaio_inicio_ts is None:
@@ -497,109 +486,157 @@ if st.session_state.modo_tela == "captura":
     if ctx and ctx.video_processor:
         snap = ctx.video_processor.get_snapshot()
 
-    status = snap["status"] if snap and snap["status"] else "NÃO ANALISADO"
-    score = f'{snap["red_score_smooth"]:.1f}' if snap and snap["red_score_smooth"] is not None else "-"
-    pulsos = snap["pulse_count"] if snap else 0
+    if st.session_state.tipo_deteccao == "Manual":
+        pulsos = int(st.session_state.pulsos_manuais)
+        st.markdown(
+            f'<div class="top-strip">MANUAL | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s</div>',
+            unsafe_allow_html=True
+        )
 
-    st.markdown(
-        f'<div class="top-strip">'
-        f'{status} | Score: {score} | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s'
-        f'</div>',
-        unsafe_allow_html=True
-    )
+        st.markdown("### Modo manual")
+        st.info("Neste modo não usa câmera. A contagem é feita nos botões + e -.")
 
-    cam_col, side_col = st.columns([4.5, 1.5])
+        st.markdown(
+            f"""
+            <div class="compact-box" style="text-align:center;">
+                <h2 style="margin:0;">Pulsos atuais</h2>
+                <h1 style="margin:0;">{pulsos}</h1>
+                <p style="margin:0;">Tempo restante: {tempo_restante}s</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-    with cam_col:
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            if st.button("Iniciar", use_container_width=True):
+                if st.session_state.ensaio_inicio_ts is None:
+                    st.session_state.ensaio_inicio_ts = time.time()
+                st.rerun()
+        with a2:
+            if st.button("Finalizar", use_container_width=True):
+                st.session_state.modo_tela = "config_ensaio"
+                st.session_state.ensaio_inicio_ts = None
+                st.rerun()
+        with a3:
+            if st.button("+", use_container_width=True):
+                st.session_state.pulsos_manuais += 1
+                st.rerun()
+        with a4:
+            if st.button("-", use_container_width=True):
+                if st.session_state.pulsos_manuais > 0:
+                    st.session_state.pulsos_manuais -= 1
+                st.rerun()
+
+    else:
+        status = snap["status"] if snap and snap["status"] else "NÃO ANALISADO"
+        score = f'{snap["red_score_smooth"]:.1f}' if snap and snap["red_score_smooth"] is not None else "-"
+        pulsos = snap["pulse_count"] if snap else 0
+
+        st.markdown(
+            f'<div class="top-strip">{st.session_state.tipo_deteccao} | {status} | Score: {score} | Pulsos: {pulsos} | Tempo restante: {tempo_restante}s</div>',
+            unsafe_allow_html=True
+        )
+
         st.caption("Área principal de captura")
         if not (ctx and ctx.state.playing):
             st.info("Clique em START para abrir a câmera ao vivo.")
-        # o player do webrtc já aparece automaticamente aqui na página
 
-    with side_col:
-        st.markdown('<div class="compact-box"><b>Calibrar / verificar LED</b></div>', unsafe_allow_html=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Salvar OFF", use_container_width=True):
-                if ctx and ctx.video_processor:
-                    s = ctx.video_processor.get_snapshot()
-                    if s["red_score_smooth"] is not None:
-                        st.session_state.calib_off = float(s["red_score_smooth"])
-                        st.session_state.saved_message = f'OFF salvo: {s["red_score_smooth"]:.2f}'
-        with c2:
-            if st.button("Salvar ON", use_container_width=True):
-                if ctx and ctx.video_processor:
-                    s = ctx.video_processor.get_snapshot()
-                    if s["red_score_smooth"] is not None:
-                        st.session_state.calib_on = float(s["red_score_smooth"])
-                        st.session_state.saved_message = f'ON salvo: {s["red_score_smooth"]:.2f}'
-
-        if st.button("Verificar LED", use_container_width=True):
-            if ctx and ctx.video_processor:
-                inicio = time.time()
-                coletados = []
-                while (time.time() - inicio) < int(st.session_state.verificacao_led_seg):
-                    s = ctx.video_processor.get_snapshot()
-                    if s and s["red_score_smooth"] is not None:
-                        coletados.append(float(s["red_score_smooth"]))
-                    time.sleep(0.2)
-                if coletados:
-                    amplitude = max(coletados) - min(coletados)
-                    st.session_state.detector_verificado = amplitude > 5
-                    if st.session_state.detector_verificado:
-                        st.success(f"Detector respondeu. Amplitude observada: {amplitude:.2f}")
-                    else:
-                        st.warning(f"Sinal fraco. Amplitude observada: {amplitude:.2f}")
-                else:
-                    st.error("Não foi possível coletar sinal do LED.")
-
-        if st.button("Limpar calibração", use_container_width=True):
-            st.session_state.calib_off = None
-            st.session_state.calib_on = None
-            st.session_state.saved_message = "Calibração limpa."
-
-        if st.session_state.saved_message:
-            st.success(st.session_state.saved_message)
-
-        if snap and snap["red_score_smooth"] is not None:
-            st.markdown('<div class="compact-box"><b>Diagnóstico</b></div>', unsafe_allow_html=True)
-            df = pd.DataFrame(
-                [
-                    {"Métrica": "Status", "Valor": snap["status"]},
-                    {"Métrica": "Score", "Valor": round(float(snap["red_score_smooth"]), 2)},
-                    {"Métrica": "Confiança (%)", "Valor": round(float(snap["confidence"]), 1)},
-                    {"Métrica": "Threshold ON", "Valor": None if snap["threshold_on"] is None else round(float(snap["threshold_on"]), 2)},
-                    {"Métrica": "Threshold OFF", "Valor": None if snap["threshold_off"] is None else round(float(snap["threshold_off"]), 2)},
-                    {"Métrica": "Qualidade último pulso", "Valor": snap["last_pulse_quality"]},
-                    {"Métrica": "Intervalo médio (s)", "Valor": snap["intervalo_medio"]},
-                ]
-            )
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        if st.button("Finalizar", use_container_width=True):
-            st.session_state.modo_tela = "config_ensaio"
-            st.session_state.ensaio_inicio_ts = None
+        toggle_txt = "Ocultar calibração/diagnóstico" if st.session_state.mostrar_painel_debug else "Mostrar calibração/diagnóstico"
+        if st.button(toggle_txt, use_container_width=True):
+            st.session_state.mostrar_painel_debug = not st.session_state.mostrar_painel_debug
             st.rerun()
-    with a2:
-        if st.button("+", use_container_width=True):
-            st.info("Ajuste manual + reservado para próxima integração.")
-    with a3:
-        if st.button("-", use_container_width=True):
-            st.info("Ajuste manual - reservado para próxima integração.")
 
-    st.markdown('<div class="bottom-actions"></div>', unsafe_allow_html=True)
+        if st.session_state.mostrar_painel_debug:
+            st.markdown('<div class="compact-box"><b>Calibrar / verificar detector</b></div>', unsafe_allow_html=True)
 
-    if ctx and ctx.state.playing and ctx.video_processor:
-        logs = ctx.video_processor.get_snapshot().get("pulse_events", [])
-        if logs:
-            st.markdown("### Eventos de pulso")
-            st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                if st.button("Salvar OFF", use_container_width=True):
+                    if ctx and ctx.video_processor:
+                        s = ctx.video_processor.get_snapshot()
+                        if s["red_score_smooth"] is not None:
+                            st.session_state.calib_off = float(s["red_score_smooth"])
+                            st.session_state.saved_message = f'OFF salvo: {s["red_score_smooth"]:.2f}'
+                            st.rerun()
+            with c2:
+                if st.button("Salvar ON", use_container_width=True):
+                    if ctx and ctx.video_processor:
+                        s = ctx.video_processor.get_snapshot()
+                        if s["red_score_smooth"] is not None:
+                            st.session_state.calib_on = float(s["red_score_smooth"])
+                            st.session_state.saved_message = f'ON salvo: {s["red_score_smooth"]:.2f}'
+                            st.rerun()
+            with c3:
+                if st.button("Verificar detector", use_container_width=True):
+                    if ctx and ctx.video_processor:
+                        inicio = time.time()
+                        coletados = []
+                        while (time.time() - inicio) < int(st.session_state.verificacao_led_seg):
+                            s = ctx.video_processor.get_snapshot()
+                            if s and s["red_score_smooth"] is not None:
+                                coletados.append(float(s["red_score_smooth"]))
+                            time.sleep(0.2)
+                        if coletados:
+                            amplitude = max(coletados) - min(coletados)
+                            st.session_state.detector_verificado = amplitude > 5
+                            if st.session_state.detector_verificado:
+                                st.success(f"Detector respondeu. Amplitude: {amplitude:.2f}")
+                            else:
+                                st.warning(f"Sinal fraco. Amplitude: {amplitude:.2f}")
+            with c4:
+                if st.button("Limpar calibração", use_container_width=True):
+                    st.session_state.calib_off = None
+                    st.session_state.calib_on = None
+                    st.session_state.saved_message = "Calibração limpa."
+                    st.rerun()
+
+            if st.session_state.saved_message:
+                st.success(st.session_state.saved_message)
+
+            if snap and snap["red_score_smooth"] is not None:
+                st.markdown('<div class="compact-box"><b>Diagnóstico</b></div>', unsafe_allow_html=True)
+                df = pd.DataFrame(
+                    [
+                        {"Métrica": "Status", "Valor": snap["status"]},
+                        {"Métrica": "Score", "Valor": round(float(snap["red_score_smooth"]), 2)},
+                        {"Métrica": "Confiança (%)", "Valor": round(float(snap["confidence"]), 1)},
+                        {"Métrica": "Threshold ON", "Valor": None if snap["threshold_on"] is None else round(float(snap["threshold_on"]), 2)},
+                        {"Métrica": "Threshold OFF", "Valor": None if snap["threshold_off"] is None else round(float(snap["threshold_off"]), 2)},
+                        {"Métrica": "Qualidade último pulso", "Valor": snap["last_pulse_quality"]},
+                        {"Métrica": "Intervalo médio (s)", "Valor": snap["intervalo_medio"]},
+                    ]
+                )
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="action-row">', unsafe_allow_html=True)
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            if st.button("Iniciar", use_container_width=True):
+                if st.session_state.ensaio_inicio_ts is None:
+                    st.session_state.ensaio_inicio_ts = time.time()
+                st.rerun()
+        with a2:
+            if st.button("Finalizar", use_container_width=True):
+                st.session_state.modo_tela = "config_ensaio"
+                st.session_state.ensaio_inicio_ts = None
+                st.rerun()
+        with a3:
+            if st.button("+", use_container_width=True):
+                st.info("Ajuste manual + reservado para integração.")
+        with a4:
+            if st.button("-", use_container_width=True):
+                st.info("Ajuste manual - reservado para integração.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if ctx and ctx.state.playing and ctx.video_processor:
+            logs = ctx.video_processor.get_snapshot().get("pulse_events", [])
+            if logs and st.session_state.mostrar_painel_debug:
+                st.markdown("### Eventos de pulso")
+                st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
 
 # =============================================================================
-# TELA CONFIG
+# CONFIG ENSAIO
 # =============================================================================
 else:
     st.info(
@@ -607,6 +644,7 @@ else:
         "A configuração do ensaio fica nesta tela. "
         "Ao abrir o modo captura, a câmera ocupa a maior parte do celular."
     )
+
     if ctx and ctx.state.playing and ctx.video_processor:
         s = ctx.video_processor.get_snapshot()
         if s and s["red_score_smooth"] is not None:
