@@ -1,24 +1,19 @@
 # app.py
-# PulseLab v5 - Administração interna + detecção experimental de pulso LED
+# PulseLab v5.1 - Administração interna + detector ao vivo multi-LED
 # -----------------------------------------------------------------------------
-# O que esta versão entrega:
-# - Login interno com SQLite (sem depender de OIDC)
-# - Bootstrap do primeiro administrador dentro do próprio app
-# - Admin controla usuários no próprio app
-# - Cadastro, ativação/bloqueio, troca de senha, papéis
-# - Histórico e auditoria local
-# - Módulo de ensaio baseado na linha v4 aprovada
-# - "IA de detecção de pulso" EXPERIMENTAL:
-#   * análise óptica do LED vermelho
-#   * calibração OFF / ON
-#   * score do vermelho
-#   * confiança da leitura
+# Mantém:
+# - login interno com SQLite
+# - bootstrap do primeiro admin
+# - admin controla usuários no próprio app
+# - cadastro, ativação/bloqueio, troca de senha, papéis
+# - histórico e auditoria local
+# - módulo de ensaio baseado na versão estável
 #
-# Limitação importante:
-# - esta versão NÃO faz contagem contínua em vídeo em tempo real.
-# - o modo "IA" aqui é assistido/experimental por captura de imagem.
-# - para detecção automática contínua de pulsos, a próxima etapa ideal é:
-#   streamlit-webrtc + OpenCV.
+# Evolui:
+# - detector ao vivo com streamlit-webrtc
+# - detecção multi-LED: vermelho, amarelo e branco
+# - configurações jogadas para a sidebar
+# - modo Manual / IA LED ao vivo / Tarja (placeholder)
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -26,21 +21,23 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
-import os
-import secrets
 import sqlite3
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
+import av
+import cv2
 import numpy as np
 import pandas as pd
 import qrcode
 import streamlit as st
 from PIL import Image
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-st.set_page_config(page_title="PulseLab v5", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="PulseLab v5.1", page_icon="⚡", layout="wide")
 
 APP_DIR = Path(".")
 DB_PATH = APP_DIR / "pulselab_v5.db"
@@ -162,24 +159,12 @@ def list_users_df() -> pd.DataFrame:
         return pd.DataFrame(columns=["id", "username", "full_name", "role", "is_active", "created_at", "updated_at"])
     return pd.DataFrame([dict(r) for r in rows])
 
-def get_config(key: str, default: str = "") -> str:
-    row = CONN.execute("SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
-    return default if row is None else str(row["value"] or "")
-
-def set_config(key: str, value: str):
-    CONN.execute("""
-        INSERT INTO app_config(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (key, value))
-    CONN.commit()
-
 # =============================================================================
 # ESTADO
 # =============================================================================
 def init_state():
     defaults = {
         "auth_user": None,
-        "page": "Ensaio",
         "pulsos": 0,
         "rodando": False,
         "inicio": None,
@@ -197,13 +182,15 @@ def init_state():
         "classe": "B (1%)",
         "tolerancia": 1.30,
         "captura_modo": "Manual",
-        "calibracao_aberta": False,
-        "calib_off": None,
-        "calib_on": None,
         "mostrar_tabela_parametros": True,
         "app_logo_bytes": None,
         "app_logo_name": None,
-        "admin_new_pwd": "",
+        "detector_enabled": True,
+        "show_overlay": True,
+        "roi_size": 0.20,
+        "smooth_window": 5,
+        "manual_plusminus_enabled": True,
+        "live_last_snapshot": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -241,6 +228,15 @@ div[data-testid="stMetric"] {
     border-radius: 16px;
     padding: 1rem;
 }
+.top-strip {
+    background: #111;
+    color: #f7ea1c;
+    border-radius: 14px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    font-weight: 800;
+    font-size: 0.92rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -250,11 +246,12 @@ CLASSES = {
     "C (0.5%)": 0.70,
     "D (0.2%)": 0.30,
 }
-CONSTANTES = [0.1, 0.2, 0.5, 1.0, 1.25, 1.5, 2.0, 2.4, 3.6, 4.8, 5.4, 6.25, 7.2, 8.0, 9.6, 10.8, 21.6]
 
-def set_page(page: str):
-    st.session_state.page = page
-    st.rerun()
+CONSTANTES = [
+    0.100, 0.200, 0.300, 0.400, 0.500, 0.600, 0.625, 0.900, 0.960,
+    1.000, 1.250, 1.500, 1.800, 2.000, 2.400, 2.800, 3.000, 3.125,
+    3.600, 4.800, 5.400, 6.250, 7.200, 8.000, 9.600, 10.800, 21.600
+]
 
 def get_local_ip():
     import socket
@@ -289,7 +286,7 @@ def salvar_logo(uploaded_file):
 # AUTH - BOOTSTRAP
 # =============================================================================
 def bootstrap_first_admin():
-    st.title("⚡ PulseLab v5")
+    st.title("⚡ PulseLab v5.1")
     st.subheader("Primeiro acesso - criar administrador master")
     st.info("Como ainda não existe usuário, crie agora o administrador principal do sistema.")
 
@@ -320,9 +317,9 @@ def bootstrap_first_admin():
     st.stop()
 
 def login_screen():
-    st.title("🔒 PulseLab v5")
+    st.title("🔒 PulseLab v5.1")
     st.subheader("Login interno")
-    st.caption("Administração interna de usuários + detecção experimental de pulso LED")
+    st.caption("Administração interna + detector ao vivo multi-LED")
 
     with st.form("login_form"):
         username = st.text_input("Usuário")
@@ -354,6 +351,191 @@ AUTH = st.session_state.auth_user
 IS_ADMIN = AUTH["role"] == "admin"
 
 # =============================================================================
+# DETECTOR AO VIVO
+# =============================================================================
+class ContadorPulso:
+    def __init__(self, limiar_on=30.0, limiar_off=20.0, debounce_s=0.25, min_on_s=0.08, min_off_s=0.08):
+        self.limiar_on = float(limiar_on)
+        self.limiar_off = float(limiar_off)
+        self.debounce_s = float(debounce_s)
+        self.min_on_s = float(min_on_s)
+        self.min_off_s = float(min_off_s)
+
+        self.estado = "OFF"
+        self.pulsos = 0
+        self.ultimo_pulso_ts = 0.0
+        self.ultima_transicao_ts = time.time()
+
+    def atualizar_parametros(self, limiar_on, limiar_off, debounce_s, min_on_s, min_off_s):
+        self.limiar_on = float(limiar_on)
+        self.limiar_off = float(limiar_off)
+        self.debounce_s = float(debounce_s)
+        self.min_on_s = float(min_on_s)
+        self.min_off_s = float(min_off_s)
+
+    def atualizar(self, score: float):
+        agora = time.time()
+        pulso_confirmado = False
+
+        if self.estado == "OFF":
+            tempo_off = agora - self.ultima_transicao_ts
+            if score >= self.limiar_on and tempo_off >= self.min_off_s:
+                self.estado = "ON"
+                self.ultima_transicao_ts = agora
+
+        elif self.estado == "ON":
+            if score <= self.limiar_off:
+                tempo_on = agora - self.ultima_transicao_ts
+                tempo_desde_ultimo = agora - self.ultimo_pulso_ts
+
+                if tempo_on >= self.min_on_s and tempo_desde_ultimo >= self.debounce_s:
+                    self.pulsos += 1
+                    self.ultimo_pulso_ts = agora
+                    pulso_confirmado = True
+
+                self.estado = "OFF"
+                self.ultima_transicao_ts = agora
+
+        return self.estado, self.pulsos, pulso_confirmado
+
+@dataclass
+class DetectorConfig:
+    roi_size: float
+    show_overlay: bool
+    smooth_window: int
+    detector_enabled: bool
+    debounce_ms: int
+
+class PulseDetectorProcessor:
+    def __init__(self, config: DetectorConfig):
+        self.config = config
+        self.lock = threading.Lock()
+        self.buffer = deque(maxlen=max(1, int(config.smooth_window)))
+        self.contador = ContadorPulso(
+            limiar_on=30.0,
+            limiar_off=20.0,
+            debounce_s=float(config.debounce_ms) / 1000.0,
+            min_on_s=0.08,
+            min_off_s=0.08,
+        )
+        self.score = 0.0
+        self.pulsos = 0
+        self.status = "AGUARDANDO"
+        self.last_color = "-"
+        self.last_area = 0.0
+        self.last_brilho = 0.0
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        h, w = img.shape[:2]
+
+        size = int(min(w, h) * float(self.config.roi_size))
+        x = w // 2 - size // 2
+        y = h // 2 - size // 2
+        roi = img[y:y + size, x:x + size]
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # vermelho
+        red1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+        red2 = cv2.inRange(hsv, (160, 80, 80), (180, 255, 255))
+        red_mask = cv2.add(red1, red2)
+
+        # amarelo
+        yellow_mask = cv2.inRange(hsv, (15, 80, 80), (35, 255, 255))
+
+        # branco
+        white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
+
+        color_masks = [
+            ("VERMELHO", red_mask),
+            ("AMARELO", yellow_mask),
+            ("BRANCO", white_mask),
+        ]
+
+        merged_mask = red_mask + yellow_mask + white_mask
+        score_full = (np.sum(merged_mask) / (merged_mask.size * 255)) * 100.0
+
+        melhor = None
+        best_score = 0.0
+        best_color = "-"
+
+        for color_name, mask in color_masks:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < 3:
+                    continue
+
+                mask_c = np.zeros(mask.shape, np.uint8)
+                cv2.drawContours(mask_c, [c], -1, 255, -1)
+                brilho = cv2.mean(hsv[:, :, 2], mask=mask_c)[0]
+
+                score = area * brilho
+                if score > best_score:
+                    best_score = score
+                    melhor = (c, area, brilho)
+                    best_color = color_name
+
+        if melhor:
+            c, area, brilho = melhor
+            self.last_color = best_color
+            self.last_area = float(area)
+            self.last_brilho = float(brilho)
+
+            if area >= 3 and brilho >= 70:
+                score = score_full * 1.20
+                self.status = f"{best_color}"
+            else:
+                score = score_full * 0.60
+                self.status = f"{best_color} FRACO"
+        else:
+            score = score_full * 0.75
+            self.status = "SEM LED"
+            self.last_color = "-"
+            self.last_area = 0.0
+            self.last_brilho = 0.0
+
+        self.buffer.append(score)
+        score = float(np.mean(self.buffer))
+        self.score = score
+
+        if self.config.detector_enabled:
+            estado, pulsos, pulso = self.contador.atualizar(score)
+            self.pulsos = pulsos
+            if pulso:
+                self.status = "PULSO DETECTADO"
+            elif estado == "ON" and self.status == "SEM LED":
+                self.status = "LED ON"
+            elif estado == "OFF" and self.status == "SEM LED":
+                self.status = "LED OFF"
+
+        if self.config.show_overlay:
+            cv2.rectangle(img, (x, y), (x + size, y + size), (0, 255, 255), 2)
+            cv2.putText(
+                img,
+                f"{self.status} | P:{self.pulsos}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2
+            )
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    def get_snapshot(self):
+        with self.lock:
+            return {
+                "status": self.status,
+                "red_score_smooth": round(self.score, 2),
+                "pulse_count": int(self.pulsos),
+                "color": self.last_color,
+                "area": round(self.last_area, 2),
+                "brilho": round(self.last_brilho, 2),
+            }
+
+# =============================================================================
 # ENSAIO HELPERS
 # =============================================================================
 def reset_ensaio():
@@ -378,6 +560,13 @@ def registrar_pulso():
 def remover_pulso():
     if st.session_state.rodando and st.session_state.pulsos > 0:
         st.session_state.pulsos -= 1
+
+def sync_pulsos_from_detector(ctx):
+    if ctx and ctx.video_processor:
+        snap = ctx.video_processor.get_snapshot()
+        st.session_state.live_last_snapshot = snap
+        if st.session_state.rodando and st.session_state.captura_modo == "IA LED ao vivo":
+            st.session_state.pulsos = int(snap["pulse_count"])
 
 def calcular_potencia(tensao, corrente, fp):
     return tensao * corrente * fp
@@ -424,42 +613,6 @@ def tabela_parametros(potencia, constante, tempo_pulso, tempo_sug, meta_pulsos):
     ])
 
 # =============================================================================
-# IA EXPERIMENTAL LED
-# =============================================================================
-def analyze_led_image(uploaded_file):
-    if uploaded_file is None:
-        return None, None, None
-
-    img = Image.open(uploaded_file).convert("RGB")
-    arr = np.array(img)
-
-    r = float(arr[:, :, 0].mean())
-    g = float(arr[:, :, 1].mean())
-    b = float(arr[:, :, 2].mean())
-    red_score = r - ((g + b) / 2.0)
-
-    if st.session_state.calib_off is not None and st.session_state.calib_on is not None:
-        threshold = (st.session_state.calib_off + st.session_state.calib_on) / 2.0
-        status = "LED LIGADO" if red_score >= threshold else "LED DESLIGADO"
-        distance = abs(red_score - threshold)
-        confidence = min(99.0, max(40.0, 40.0 + distance))
-    else:
-        status = "LED LIGADO" if red_score > 20 else "LED DESLIGADO"
-        confidence = 55.0 if abs(red_score - 20) < 10 else 78.0
-
-    df = pd.DataFrame([
-        {"Métrica": "R médio", "Valor": round(r, 2)},
-        {"Métrica": "G médio", "Valor": round(g, 2)},
-        {"Métrica": "B médio", "Valor": round(b, 2)},
-        {"Métrica": "Red Score", "Valor": round(red_score, 2)},
-        {"Métrica": "Status óptico", "Valor": status},
-        {"Métrica": "Confiança (%)", "Valor": round(confidence, 1)},
-        {"Métrica": "Calibração OFF", "Valor": st.session_state.calib_off},
-        {"Métrica": "Calibração ON", "Valor": st.session_state.calib_on},
-    ])
-    return img, df, red_score
-
-# =============================================================================
 # TOPO
 # =============================================================================
 left, mid, right = st.columns([3, 1.3, 1.2])
@@ -467,11 +620,11 @@ with left:
     if st.session_state.app_logo_bytes:
         b64 = base64.b64encode(st.session_state.app_logo_bytes).decode("utf-8")
         st.markdown(
-            f'<div style="display:flex;align-items:center;gap:12px;"><img src="data:image/png;base64,{b64}" style="height:48px;border-radius:8px;"><h1 style="margin:0;">PulseLab v5</h1></div>',
+            f'<div style="display:flex;align-items:center;gap:12px;"><img src="data:image/png;base64,{b64}" style="height:48px;border-radius:8px;"><h1 style="margin:0;">PulseLab v5.1</h1></div>',
             unsafe_allow_html=True
         )
     else:
-        st.title("⚡ PulseLab v5")
+        st.title("⚡ PulseLab v5.1")
 
 with mid:
     st.write(f"**Usuário:** {AUTH['full_name']}")
@@ -483,10 +636,65 @@ with right:
         st.session_state.auth_user = None
         st.rerun()
 
-menu_options = ["Ensaio", "Histórico", "Configurações"]
+# =============================================================================
+# SIDEBAR = CONFIGURAÇÕES GERAIS + ADMIN RÁPIDO
+# =============================================================================
+with st.sidebar:
+    st.header("⚙️ Configurações")
+
+    st.session_state.modo_interface = st.radio(
+        "Modo de interface",
+        ["Desktop", "Mobile"],
+        index=0 if st.session_state.modo_interface == "Desktop" else 1,
+        horizontal=True,
+    )
+
+    st.session_state.camera_habilitada = st.toggle("Habilitar câmera", value=st.session_state.camera_habilitada)
+    st.session_state.tempo_automatico = st.toggle("Tempo automático", value=st.session_state.tempo_automatico)
+    st.session_state.alvo_pulsos_auto = st.number_input("Pulsos alvo auto", min_value=1, max_value=100, value=int(st.session_state.alvo_pulsos_auto), step=1)
+    st.session_state.tempo_minimo_seg = st.number_input("Tempo mínimo (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_minimo_seg), step=1)
+    st.session_state.tempo_maximo_seg = st.number_input("Tempo máximo (s)", min_value=5, max_value=7200, value=int(st.session_state.tempo_maximo_seg), step=1)
+    st.session_state.debounce_ms = st.number_input("Debounce (ms)", min_value=50, max_value=5000, value=int(st.session_state.debounce_ms), step=10)
+
+    st.markdown("### Detector ao vivo")
+    st.session_state.detector_enabled = st.toggle("Detector ativo", value=st.session_state.detector_enabled)
+    st.session_state.show_overlay = st.toggle("Mostrar overlay", value=st.session_state.show_overlay)
+    st.session_state.roi_size = st.slider("Tamanho ROI", 0.10, 0.50, float(st.session_state.roi_size), 0.01)
+    st.session_state.smooth_window = st.slider("Suavização (frames)", 1, 15, int(st.session_state.smooth_window), 1)
+
+    st.markdown("### QR Code")
+    st.session_state.mostrar_qrcode = st.toggle("Mostrar QR Code", value=st.session_state.mostrar_qrcode)
+    if st.session_state.mostrar_qrcode:
+        render_qrcode(8501)
+
+    st.markdown("### Imagem / Logo")
+    up_logo = st.file_uploader("Adicionar imagem do app", type=["png", "jpg", "jpeg", "webp"])
+    if up_logo is not None:
+        salvar_logo(up_logo)
+        st.success("Imagem do app atualizada.")
+    if st.session_state.app_logo_bytes:
+        st.image(st.session_state.app_logo_bytes, width=140)
+
+    if IS_ADMIN:
+        st.markdown("---")
+        st.markdown("### 👤 Usuários (rápido)")
+        novo = st.text_input("Novo usuário")
+        senha = st.text_input("Senha usuário", type="password")
+        nivel = st.selectbox("Nível", ["tecnico", "admin"])
+        if st.button("Criar usuário", use_container_width=True):
+            try:
+                if not novo.strip() or not senha:
+                    st.error("Informe usuário e senha.")
+                else:
+                    create_user(novo.strip().lower(), novo.strip(), senha, nivel, True)
+                    log_event(AUTH["username"], "create_user_sidebar", f"user={novo.strip().lower()}; role={nivel}")
+                    st.success("Usuário criado.")
+            except sqlite3.IntegrityError:
+                st.error("Esse usuário já existe.")
+
+menu_options = ["Ensaio", "Histórico"]
 if IS_ADMIN:
     menu_options.append("Admin")
-
 selected = st.radio("Menu", menu_options, horizontal=True, label_visibility="collapsed")
 
 # =============================================================================
@@ -512,7 +720,7 @@ if selected == "Ensaio":
     with a3:
         st.session_state.captura_modo = st.selectbox(
             "Modo de captura",
-            ["Manual", "IA LED Vermelho (experimental)", "Tarja Eletromecânico (futuro)"],
+            ["Manual", "IA LED ao vivo", "Tarja Eletromecânico (futuro)"],
         )
 
     potencia = calcular_potencia(tensao, corrente, fp)
@@ -546,57 +754,50 @@ if selected == "Ensaio":
                 hide_index=True,
             )
 
-    if int(meta_pulsos) < 5:
-        st.warning("Meta de pulsos muito baixa. Para um ensaio mais robusto, prefira pelo menos 5 pulsos.")
-    elif int(meta_pulsos) >= 10:
-        st.success("Meta de pulsos boa para teste operacional mais consistente.")
+    # detector ao vivo
+    ctx = None
+    if st.session_state.captura_modo == "IA LED ao vivo" and st.session_state.camera_habilitada:
+        st.markdown('<div class="big-live-box">', unsafe_allow_html=True)
+        st.markdown('<div class="live-title">🔴🟡⚪ Detector ao vivo multi-LED</div>', unsafe_allow_html=True)
+        st.caption("Detecção ao vivo para LED vermelho, amarelo e branco.")
 
-    if st.session_state.captura_modo == "IA LED Vermelho (experimental)":
-        if st.session_state.rodando:
-            st.markdown('<div class="big-live-box">', unsafe_allow_html=True)
-            st.markdown('<div class="live-title">🔴 IA LED - captura assistida</div>', unsafe_allow_html=True)
-            st.caption(
-                "Nesta v5, a IA é experimental por captura. "
-                "Ela indica estado do LED e confiança, mas não faz contagem contínua automática ainda."
+        det_cfg = DetectorConfig(
+            roi_size=float(st.session_state.roi_size),
+            show_overlay=bool(st.session_state.show_overlay),
+            smooth_window=int(st.session_state.smooth_window),
+            detector_enabled=bool(st.session_state.detector_enabled),
+            debounce_ms=int(st.session_state.debounce_ms),
+        )
+
+        ctx = webrtc_streamer(
+            key="pulselab-live-detector",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=lambda: PulseDetectorProcessor(det_cfg),
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+        if ctx and ctx.video_processor:
+            sync_pulsos_from_detector(ctx)
+            snap = st.session_state.live_last_snapshot or ctx.video_processor.get_snapshot()
+            st.markdown(
+                f'<div class="top-strip">Status: {snap["status"]} | Score: {snap["red_score_smooth"]} | Pulsos: {snap["pulse_count"]} | Cor: {snap["color"]}</div>',
+                unsafe_allow_html=True
             )
-            live_file = st.camera_input("Captura atual do LED", key="camera_led_live")
-            img, metrics_df, _ = analyze_led_image(live_file)
-            if img is not None:
-                st.image(img, caption="Captura atual", use_container_width=True)
-                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Aguardando captura do LED.")
-            st.markdown('</div>', unsafe_allow_html=True)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Pulsos detector", snap["pulse_count"])
+            m2.metric("Status", snap["status"])
+            m3.metric("Score", snap["red_score_smooth"])
+            m4.metric("Cor", snap["color"])
         else:
-            b1, b2 = st.columns([1, 3])
-            with b1:
-                if st.button("🎯 Calibração IA LED", use_container_width=True):
-                    st.session_state.calibracao_aberta = not st.session_state.calibracao_aberta
-                    st.rerun()
-            with b2:
-                st.info(f"Calibração: {'ativa' if st.session_state.calibracao_aberta else 'oculta'}")
+            st.info("Clique em START para abrir a câmera ao vivo.")
 
-            if st.session_state.calibracao_aberta:
-                calib_file = st.camera_input("Capturar referência do LED", key="camera_led_calib")
-                img, metrics_df, red_score = analyze_led_image(calib_file)
-                if img is not None:
-                    st.image(img, caption="Imagem para análise", use_container_width=True)
-                    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-                    ccal1, ccal2, ccal3 = st.columns(3)
-                    with ccal1:
-                        if st.button("Salvar OFF", use_container_width=True):
-                            st.session_state.calib_off = red_score
-                            st.success(f"OFF salvo: {round(red_score, 2)}")
-                    with ccal2:
-                        if st.button("Salvar ON", use_container_width=True):
-                            st.session_state.calib_on = red_score
-                            st.success(f"ON salvo: {round(red_score, 2)}")
-                    with ccal3:
-                        if st.button("Limpar calibração", use_container_width=True):
-                            st.session_state.calib_off = None
-                            st.session_state.calib_on = None
-                            st.success("Calibração limpa.")
+    elif st.session_state.captura_modo == "Tarja Eletromecânico (futuro)":
+        st.info("Modo Tarja é um placeholder por enquanto.")
+    else:
+        st.info("Modo Manual ativo.")
 
     st.subheader("Execução do ensaio")
 
@@ -647,15 +848,20 @@ if selected == "Ensaio":
 
     with b2:
         if st.button("+", use_container_width=True):
-            registrar_pulso()
+            if st.session_state.captura_modo == "Manual":
+                registrar_pulso()
             st.rerun()
 
     with b3:
         if st.button("-", use_container_width=True):
-            remover_pulso()
+            if st.session_state.captura_modo == "Manual":
+                remover_pulso()
             st.rerun()
 
     if st.session_state.rodando:
+        if st.session_state.captura_modo == "IA LED ao vivo" and ctx and ctx.video_processor:
+            sync_pulsos_from_detector(ctx)
+
         tempo_decorrido = time.time() - st.session_state.inicio
         energia_teorica = energia_teorica_wh(potencia, tempo_decorrido)
         energia_medida = energia_medida_wh(st.session_state.pulsos, constante)
@@ -711,38 +917,11 @@ elif selected == "Histórico":
         for i, item in enumerate(st.session_state.historico_local):
             titulo = f"{item['datahora']} | {item['status']} | erro {item['erro']}%"
             with st.expander(titulo, expanded=(i == 0)):
-                st.dataframe(pd.DataFrame([{"Campo": k, "Valor": v} for k, v in item.items()]), use_container_width=True, hide_index=True)
-
-# =============================================================================
-# CONFIG
-# =============================================================================
-elif selected == "Configurações":
-    st.subheader("Configurações do app")
-    st.session_state.modo_interface = st.radio(
-        "Modo de interface",
-        ["Desktop", "Mobile"],
-        index=0 if st.session_state.modo_interface == "Desktop" else 1,
-        horizontal=True,
-    )
-    st.session_state.camera_habilitada = st.toggle("Habilitar câmera no ensaio", value=st.session_state.camera_habilitada)
-    st.session_state.tempo_automatico = st.toggle("Usar tempo automático por padrão", value=st.session_state.tempo_automatico)
-    st.session_state.alvo_pulsos_auto = st.number_input("Pulsos alvo do tempo automático", min_value=1, max_value=100, value=int(st.session_state.alvo_pulsos_auto), step=1)
-    st.session_state.tempo_minimo_seg = st.number_input("Tempo mínimo do ensaio (s)", min_value=1, max_value=3600, value=int(st.session_state.tempo_minimo_seg), step=1)
-    st.session_state.tempo_maximo_seg = st.number_input("Tempo máximo do ensaio (s)", min_value=5, max_value=7200, value=int(st.session_state.tempo_maximo_seg), step=1)
-    st.session_state.debounce_ms = st.number_input("Debounce entre pulsos (ms)", min_value=50, max_value=5000, value=int(st.session_state.debounce_ms), step=10)
-
-    st.markdown("### QR Code")
-    st.session_state.mostrar_qrcode = st.toggle("Mostrar QR Code de acesso", value=st.session_state.mostrar_qrcode)
-    if st.session_state.mostrar_qrcode:
-        render_qrcode(8501)
-
-    st.markdown("### Imagem / Logo do app")
-    up_logo = st.file_uploader("Adicionar imagem do app", type=["png", "jpg", "jpeg", "webp"])
-    if up_logo is not None:
-        salvar_logo(up_logo)
-        st.success("Imagem do app atualizada.")
-    if st.session_state.app_logo_bytes:
-        st.image(st.session_state.app_logo_bytes, width=140)
+                st.dataframe(
+                    pd.DataFrame([{"Campo": k, "Valor": v} for k, v in item.items()]),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
 # =============================================================================
 # ADMIN
@@ -780,9 +959,9 @@ elif selected == "Admin":
         users_df = list_users_df()
         st.dataframe(users_df, use_container_width=True, hide_index=True)
 
-        st.markdown("### Alterar usuário existente")
         usernames = [str(x) for x in users_df["username"].tolist()] if not users_df.empty else []
         if usernames:
+            st.markdown("### Alterar usuário existente")
             sel_user = st.selectbox("Selecionar usuário", usernames)
             user_row = get_user_by_username(sel_user)
 
@@ -815,8 +994,6 @@ elif selected == "Admin":
                         log_event(AUTH["username"], "reset_password", f"user={sel_user}")
                         st.success("Senha alterada.")
                         st.rerun()
-        else:
-            st.info("Nenhum usuário cadastrado além do admin inicial.")
 
     with tab2:
         st.markdown("### Auditoria do sistema")
