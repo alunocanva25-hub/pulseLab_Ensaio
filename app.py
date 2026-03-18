@@ -16,12 +16,15 @@
 # - modo Manual / IA LED ao vivo / Tarja (placeholder)
 # -----------------------------------------------------------------------------
 
+
 from __future__ import annotations
 
 import base64
 import hashlib
 import io
+import json
 import sqlite3
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
