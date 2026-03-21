@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
 
@@ -10,9 +11,9 @@ def render_historico_page():
         return
     st.caption(f"Total de registros: {len(historico)}")
     resumo = pd.DataFrame(historico)
-    cols = [c for c in ["datahora", "usuario", "captura_modo", "classe", "pulsos", "erro", "status", "robustez"] if c in resumo.columns]
-    if cols:
-        st.dataframe(resumo[cols], use_container_width=True, hide_index=True)
+    cols_existentes = [c for c in ["datahora", "usuario", "captura_modo", "classe", "pulsos", "erro", "status", "robustez"] if c in resumo.columns]
+    if cols_existentes:
+        st.dataframe(resumo[cols_existentes], use_container_width=True, hide_index=True)
     st.markdown("---")
     st.markdown("### Detalhamento")
     for i, item in enumerate(historico):
@@ -20,4 +21,3 @@ def render_historico_page():
         with st.expander(titulo, expanded=(i == 0)):
             df = pd.DataFrame([{"Campo": k, "Valor": v} for k, v in item.items()])
             st.dataframe(df, use_container_width=True, hide_index=True)
-
