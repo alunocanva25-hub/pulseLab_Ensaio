@@ -159,7 +159,17 @@ def render_ensaio_page(auth_user: dict):
         st.markdown('<div class="card-soft">', unsafe_allow_html=True)
         st.markdown("### 🔴🟡⚪ Detector ao vivo multi-LED com IA validadora")
         st.caption("A IA validadora ajuda a distinguir LED real de alvo duvidoso.")
-        det_cfg = DetectorConfig(roi_size=float(st.session_state.roi_size), show_overlay=bool(st.session_state.show_overlay), smooth_window=int(st.session_state.smooth_window), detector_enabled=bool(st.session_state.detector_enabled), debounce_ms=int(st.session_state.debounce_ms), limiar_on=30.0, limiar_off=20.0)
+        det_cfg = DetectorConfig(
+    roi_size=float(st.session_state.roi_size),
+    show_overlay=bool(st.session_state.show_overlay),
+    smooth_window=int(st.session_state.smooth_window),
+    detector_enabled=bool(st.session_state.detector_enabled),
+    debounce_ms=int(st.session_state.debounce_ms),
+    limiar_on=float(st.session_state.limiar_on),
+    limiar_off=float(st.session_state.limiar_off),
+    led_color_mode=str(st.session_state.led_color_mode),
+    fast_pulse_mode=bool(st.session_state.fast_pulse_mode),
+)
         ctx = webrtc_streamer(key="pulselab-live-detector", mode=WebRtcMode.SENDRECV, video_processor_factory=lambda: PulseDetectorProcessor(det_cfg), media_stream_constraints={"video": True, "audio": False}, async_processing=True)
         if ctx and ctx.video_processor:
             sync_pulsos_from_detector(ctx)
