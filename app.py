@@ -6,7 +6,7 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 from detector.processor import DetectorConfig, PulseDetectorProcessor
 
 st.set_page_config(
-    page_title="PulseLab – Detector com IA Validadora",
+    page_title="PulseLab – Detector Industrial",
     page_icon="🔴",
     layout="wide",
 )
@@ -27,7 +27,7 @@ for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-st.title("🔴 PulseLab – Detector com IA Validadora")
+st.title("🔴 PulseLab – Detector Industrial com IA")
 
 with st.sidebar:
     st.header("Configuração do Detector")
@@ -110,7 +110,7 @@ det_cfg = DetectorConfig(
 st.caption("Clique em START para abrir a câmera e testar o detector.")
 
 ctx = webrtc_streamer(
-    key="pulselab-detector-ia",
+    key="pulselab-detector-industrial",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=lambda: PulseDetectorProcessor(det_cfg),
     media_stream_constraints={"video": True, "audio": False},
@@ -130,11 +130,12 @@ if ctx and ctx.video_processor:
     c4.metric("Cor", snap["color"])
     c5.metric("Estado", snap["estado"])
 
-    c6, c7, c8, c9 = st.columns(4)
+    c6, c7, c8, c9, c10 = st.columns(5)
     c6.metric("Área", snap["area"])
     c7.metric("Brilho", snap["brilho"])
     c8.metric("IA confiança", snap["ai_confidence"])
     c9.metric("Alvo válido", "SIM" if snap["target_valid"] else "NÃO")
+    c10.metric("Frequência (Hz)", snap["hz"])
 
     st.info(f"Motivo IA: {snap['ai_reason']}")
 else:
