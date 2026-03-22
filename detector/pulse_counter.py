@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 
 
 class ContadorPulso:
@@ -8,9 +9,12 @@ class ContadorPulso:
         self.limiar_on = float(limiar_on)
         self.limiar_off = float(limiar_off)
         self.debounce_s = float(debounce_s)
+
         self.estado = "OFF"
         self.pulsos = 0
         self.ultimo_pulso = 0.0
+        self.pulse_times = deque(maxlen=12)
+        self.hz_estimado = 0.0
 
     def atualizar(self, score):
         agora = time.time()
@@ -24,6 +28,17 @@ class ContadorPulso:
             self.estado = "OFF"
             self.pulsos += 1
             self.ultimo_pulso = agora
+            self.pulse_times.append(agora)
             pulso_detectado = True
 
-        return self.estado, self.pulsos, pulso_detectado
+            if len(self.pulse_times) >= 2:
+                intervalos = []
+                pts = list(self.pulse_times)
+                for i in range(1, len(pts)):
+                    intervalos.append(pts[i] - pts[i - 1])
+                if intervalos:
+                    intervalo_medio = sum(intervalos) / len(intervalos)
+                    if intervalo_medio > 0:
+                        self.hz_estimado = 1.0 / intervalo_medio
+
+        return self.estado, self.pulsos, pulso_detectado, round(self.hz_estimado, 2)
