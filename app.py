@@ -24,7 +24,6 @@ DEFAULTS = {
     "auto_calibrate": True,
     "target_lock": True,
 }
-
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -189,6 +188,5 @@ if ctx and ctx.video_processor:
     st.markdown("---")
     st.markdown("### Como treinar o modelo")
     st.code("python -m detector.train_model", language="bash")
-
 else:
     st.warning("Aguardando câmera.")
