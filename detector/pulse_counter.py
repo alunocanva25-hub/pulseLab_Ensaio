@@ -5,20 +5,21 @@ from collections import deque
 
 
 class ContadorPulso:
-    def __init__(self, limiar_on=18.0, limiar_off=8.0, debounce_s=0.12):
-        self.limiar_on = float(limiar_on)
-        self.limiar_off = float(limiar_off)
-        self.debounce_s = float(debounce_s)
+    def __init__(self, limiar_on=18, limiar_off=8, debounce_s=0.12):
+        self.limiar_on = limiar_on
+        self.limiar_off = limiar_off
+        self.debounce_s = debounce_s
 
         self.estado = "OFF"
         self.pulsos = 0
-        self.ultimo_pulso = 0.0
-        self.pulse_times = deque(maxlen=12)
-        self.hz_estimado = 0.0
+        self.ultimo_pulso = 0
+
+        self.historico = deque(maxlen=10)
+        self.hz = 0
 
     def atualizar(self, score):
         agora = time.time()
-        pulso_detectado = False
+        pulso = False
 
         if score > self.limiar_on and self.estado == "OFF":
             if agora - self.ultimo_pulso > self.debounce_s:
@@ -28,17 +29,18 @@ class ContadorPulso:
             self.estado = "OFF"
             self.pulsos += 1
             self.ultimo_pulso = agora
-            self.pulse_times.append(agora)
-            pulso_detectado = True
+            pulso = True
 
-            if len(self.pulse_times) >= 2:
-                intervalos = []
-                pts = list(self.pulse_times)
-                for i in range(1, len(pts)):
-                    intervalos.append(pts[i] - pts[i - 1])
-                if intervalos:
-                    intervalo_medio = sum(intervalos) / len(intervalos)
-                    if intervalo_medio > 0:
-                        self.hz_estimado = 1.0 / intervalo_medio
+            self.historico.append(agora)
 
-        return self.estado, self.pulsos, pulso_detectado, round(self.hz_estimado, 2)
+            if len(self.historico) >= 2:
+                diffs = [
+                    self.historico[i] - self.historico[i - 1]
+                    for i in range(1, len(self.historico))
+                ]
+                if diffs:
+                    media = sum(diffs) / len(diffs)
+                    if media > 0:
+                        self.hz = round(1 / media, 2)
+
+        return self.estado, self.pulsos, pulso, self.hz
