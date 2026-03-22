@@ -8,11 +8,9 @@ import av
 import cv2
 
 from detector.ai_validator import LEDAIVerifier
-from detector.color_detector import (
-    analyze_best_target,
-    build_color_masks,
-    merge_masks,
-)
+from detector.color_detector import analyze_best_target, build_color_masks, merge_masks
+from detector.dataset import save_sample
+from detector.model_inference import DetectorModel
 from detector.pulse_counter import ContadorPulso
 
 
@@ -55,6 +53,7 @@ class PulseDetectorProcessor:
         )
 
         self.ai = LEDAIVerifier(history_size=20)
+        self.model = DetectorModel()
 
         self.score = 0.0
         self.pulsos = 0
@@ -68,9 +67,12 @@ class PulseDetectorProcessor:
         self.last_target_valid = False
         self.last_hz = 0.0
         self.prev_center = None
-
         self.current_limiar_on = float(config.limiar_on)
         self.current_limiar_off = float(config.limiar_off)
+
+        self.last_model_label = "desconhecido"
+        self.last_model_conf = 0.0
+        self.last_roi_bgr = None
 
     def _calc_full_score(self, merged_mask):
         if merged_mask is None or merged_mask.size == 0:
@@ -94,6 +96,20 @@ class PulseDetectorProcessor:
 
         return round(on, 2), round(off, 2)
 
+    def save_current_sample(self, label: str):
+        if self.last_roi_bgr is None:
+            return None
+
+        meta = {
+            "selected_color": self.config.led_color_mode,
+            "score": round(self.score, 2),
+            "status": self.status,
+            "model_label": self.last_model_label,
+            "model_conf": round(self.last_model_conf, 4),
+            "ai_conf": round(self.last_ai_confidence, 4),
+        }
+        return save_sample(self.last_roi_bgr, label, meta)
+
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
@@ -102,7 +118,9 @@ class PulseDetectorProcessor:
         x = w // 2 - size // 2
         y = h // 2 - size // 2
 
-        roi = img[y:y + size, x:x + size]
+        roi = img[y:y + size, x:x + size].copy()
+        self.last_roi_bgr = roi.copy()
+
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
         prev_center = self.prev_center if self.config.target_lock else None
@@ -119,8 +137,12 @@ class PulseDetectorProcessor:
         )
 
         ai_result = self.ai.validate(target, self.config.led_color_mode)
+        model_result = self.model.predict(roi)
 
         with self.lock:
+            self.last_model_label = model_result["label"]
+            self.last_model_conf = model_result["confidence"]
+
             self.last_target_valid = bool(ai_result["is_valid_led"])
             self.last_ai_confidence = float(ai_result["confidence"])
             self.last_ai_reason = str(ai_result["reason"])
@@ -135,6 +157,9 @@ class PulseDetectorProcessor:
                 self.last_area = 0.0
                 self.last_brilho = 0.0
                 self.prev_center = None
+
+            # combinação da IA por regras + modelo treinado
+            model_accept = model_result["label"] == "on" and model_result["confidence"] >= 0.60
 
             if target is not None and ai_result["is_valid_led"]:
                 raw = score_full * 1.30
@@ -169,7 +194,12 @@ class PulseDetectorProcessor:
                 self.contador.limiar_on = self.current_limiar_on
                 self.contador.limiar_off = self.current_limiar_off
 
-            if self.config.detector_enabled and self.last_target_valid:
+            # só conta se detector + modelo concordarem
+            allow_count = self.config.detector_enabled and self.last_target_valid
+            if self.model.is_loaded:
+                allow_count = allow_count and model_accept
+
+            if allow_count:
                 estado, pulsos, pulso, hz = self.contador.atualizar(score)
                 self.last_estado = estado
                 self.pulsos = pulsos
@@ -193,12 +223,16 @@ class PulseDetectorProcessor:
                     2,
                 )
 
+            overlay = (
+                f"{self.status} | P:{self.pulsos} | Hz:{self.last_hz} | "
+                f"M:{self.last_model_label}:{round(self.last_model_conf,2)}"
+            )
             cv2.putText(
                 img,
-                f"{self.status} | P:{self.pulsos} | Hz:{self.last_hz}",
+                overlay,
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
+                0.56,
                 (0, 255, 0),
                 2,
             )
@@ -221,4 +255,7 @@ class PulseDetectorProcessor:
                 "hz": round(self.last_hz, 2),
                 "limiar_on": round(self.current_limiar_on, 2),
                 "limiar_off": round(self.current_limiar_off, 2),
+                "model_label": self.last_model_label,
+                "model_confidence": round(self.last_model_conf, 2),
+                "model_loaded": self.model.is_loaded,
             }
