@@ -81,7 +81,7 @@ class PulseDetectorProcessor:
         score_full = self._calc_full_score(merged)
 
         target = analyze_best_target(hsv, color_masks)
-        ai_result = self.ai.validate(target)
+        ai_result = self.ai.validate(target, self.config.led_color_mode)
 
         with self.lock:
             self.last_target_valid = bool(ai_result["is_valid_led"])
