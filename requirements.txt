@@ -1,11 +1,7 @@
 streamlit[auth]
-numpy
-pandas
-pillow
-qrcode
-streamlit-webrtc
-av
-opencv-python-headless
-opencv-python
-scikit-learn
-joblib
+streamlit-webrtc==0.63.4
+opencv-python-headless==4.13.0.92
+numpy==2.4.0
+scikit-learn==1.7.1
+joblib==1.5.2
+av==14.4.0
