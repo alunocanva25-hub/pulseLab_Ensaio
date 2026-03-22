@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-import math
 import numpy as np
+import math
 
 
 class LEDAIVerifier:
@@ -22,12 +22,16 @@ class LEDAIVerifier:
     def _stability(self, values):
         if len(values) < 4:
             return 0.5
-        arr = np.array(values, dtype=float)
+
+        arr = np.array(values)
         mean = np.mean(arr)
         std = np.std(arr)
+
         if mean <= 0:
             return 0.2
+
         ratio = std / mean
+
         if ratio < 0.10:
             return 0.95
         if ratio < 0.20:
@@ -41,9 +45,12 @@ class LEDAIVerifier:
     def _position_stability(self):
         if len(self.cx_history) < 4:
             return 0.5
-        xs = np.array(self.cx_history, dtype=float)
-        ys = np.array(self.cy_history, dtype=float)
+
+        xs = np.array(self.cx_history)
+        ys = np.array(self.cy_history)
+
         std_pos = math.sqrt(np.std(xs) ** 2 + np.std(ys) ** 2)
+
         if std_pos < 2:
             return 0.95
         if std_pos < 4:
