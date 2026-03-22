@@ -7,7 +7,6 @@ from typing import Any
 
 import cv2
 
-
 DATASET_DIR = Path("dataset_led")
 META_FILE = DATASET_DIR / "metadata.jsonl"
 

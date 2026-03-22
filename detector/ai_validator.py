@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-import numpy as np
 import math
+import numpy as np
 
 
 class LEDAIVerifier:
@@ -94,7 +94,6 @@ class LEDAIVerifier:
         if color_ok:
             confidence += 0.28
 
-        # LED deve ser pequeno e brilhante
         if 3 <= area <= 120:
             confidence += 0.16
         elif area <= 180:
@@ -116,7 +115,6 @@ class LEDAIVerifier:
         else:
             confidence -= 0.10
 
-        # densidade luminosa alta é forte sinal de LED
         if density >= 8:
             confidence += 0.12
         elif density >= 4:

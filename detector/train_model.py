@@ -7,8 +7,8 @@ import cv2
 import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
 
 DATASET_DIR = Path("dataset_led")
 META_FILE = DATASET_DIR / "metadata.jsonl"
@@ -29,13 +29,12 @@ def extract_features(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray_mean = float(np.mean(gray))
     gray_std = float(np.std(gray))
-
-    # pixels bem brilhantes
     bright_ratio = float(np.mean(gray > 200))
 
-    # vermelho dominante
     b, g, r = cv2.split(img_bgr)
-    red_score = float(np.mean(r.astype(np.float32) - ((g.astype(np.float32) + b.astype(np.float32)) / 2.0)))
+    red_score = float(
+        np.mean(r.astype(np.float32) - ((g.astype(np.float32) + b.astype(np.float32)) / 2.0))
+    )
 
     return [
         h_mean, s_mean, v_mean,

@@ -17,7 +17,6 @@ class ContadorPulso:
         self.historico = deque(maxlen=10)
         self.hz = 0.0
 
-        # trava extra contra presença contínua
         self.frames_on = 0
         self.frames_off = 0
         self.min_frames_on = 2

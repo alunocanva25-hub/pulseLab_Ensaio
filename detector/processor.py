@@ -158,7 +158,6 @@ class PulseDetectorProcessor:
                 self.last_brilho = 0.0
                 self.prev_center = None
 
-            # combinação da IA por regras + modelo treinado
             model_accept = model_result["label"] == "on" and model_result["confidence"] >= 0.60
 
             if target is not None and ai_result["is_valid_led"]:
@@ -194,7 +193,6 @@ class PulseDetectorProcessor:
                 self.contador.limiar_on = self.current_limiar_on
                 self.contador.limiar_off = self.current_limiar_off
 
-            # só conta se detector + modelo concordarem
             allow_count = self.config.detector_enabled and self.last_target_valid
             if self.model.is_loaded:
                 allow_count = allow_count and model_accept

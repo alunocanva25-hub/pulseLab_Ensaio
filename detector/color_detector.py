@@ -8,7 +8,6 @@ def build_color_masks(hsv, led_color_mode="AUTOMÁTICO"):
     mode = (led_color_mode or "AUTOMÁTICO").upper()
     masks = []
 
-    # vermelho mais restrito
     if mode in ("VERMELHO", "AUTOMÁTICO"):
         r1 = cv2.inRange(hsv, (0, 120, 140), (10, 255, 255))
         r2 = cv2.inRange(hsv, (170, 120, 140), (180, 255, 255))
@@ -51,7 +50,6 @@ def analyze_best_target(hsv, color_masks, prev_center=None, prefer_center_weight
             if area < 3:
                 continue
 
-            # rejeita alvo grande demais: pele/perna/parede iluminada
             if area > roi_area * 0.08:
                 continue
 
@@ -79,7 +77,6 @@ def analyze_best_target(hsv, color_masks, prev_center=None, prefer_center_weight
             if peri > 0:
                 circ = (4 * np.pi * area) / (peri * peri)
 
-            # densidade luminosa: LED tende a ser pequeno e intenso
             intensity_density = brilho / max(area, 1.0)
 
             score = (
