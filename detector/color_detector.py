@@ -35,9 +35,9 @@ def merge_masks(color_masks):
     return merged
 
 
-def analyze_best_target(hsv, color_masks):
+def analyze_best_target(hsv, color_masks, prev_center=None, prefer_center_weight: float = 1.0):
     melhor = None
-    best_score = 0.0
+    best_score = -1e9
 
     h, w = hsv.shape[:2]
     center_x = w / 2.0
@@ -55,8 +55,14 @@ def analyze_best_target(hsv, color_masks):
             cx = x + bw / 2.0
             cy = y + bh / 2.0
 
-            dist = ((cx - center_x) ** 2 + (cy - center_y) ** 2) ** 0.5
-            dist_norm = dist / max(w, h)
+            dist_center = ((cx - center_x) ** 2 + (cy - center_y) ** 2) ** 0.5
+            dist_center_norm = dist_center / max(w, h)
+
+            dist_prev_norm = 0.0
+            if prev_center is not None:
+                px, py = prev_center
+                dist_prev = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                dist_prev_norm = dist_prev / max(w, h)
 
             mask_c = np.zeros(mask.shape, np.uint8)
             cv2.drawContours(mask_c, [c], -1, 255, -1)
@@ -74,7 +80,8 @@ def analyze_best_target(hsv, color_masks):
                 + brilho * 0.38
                 + saturacao * 0.18
                 + circularidade * 18.0
-                - dist_norm * 70.0
+                - dist_center_norm * 60.0 * prefer_center_weight
+                - dist_prev_norm * 45.0
             )
 
             if score > best_score:
@@ -87,6 +94,8 @@ def analyze_best_target(hsv, color_masks):
                     "circularity": circularidade,
                     "score": float(score),
                     "bbox": (x, y, bw, bh),
+                    "center_x": float(cx),
+                    "center_y": float(cy),
                 }
 
     return melhor
