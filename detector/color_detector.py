@@ -28,9 +28,11 @@ def build_color_masks(hsv, led_color_mode="AUTOMÁTICO"):
 def merge_masks(color_masks):
     if not color_masks:
         return None
+
     merged = None
     for _, mask in color_masks:
         merged = mask.copy() if merged is None else cv2.add(merged, mask)
+
     return merged
 
 
@@ -56,7 +58,7 @@ def analyze_best_target(hsv, color_masks, prev_center=None, prefer_center_weight
             dist_center = ((cx - cx0) ** 2 + (cy - cy0) ** 2) ** 0.5
             dist_center /= max(w, h)
 
-            dist_prev = 0.0
+            dist_prev = 0
             if prev_center:
                 px, py = prev_center
                 dist_prev = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
@@ -69,30 +71,30 @@ def analyze_best_target(hsv, color_masks, prev_center=None, prefer_center_weight
             sat = cv2.mean(hsv[:, :, 1], mask=mask_c)[0]
 
             peri = cv2.arcLength(c, True)
-            circ = 0.0
+            circ = 0
             if peri > 0:
                 circ = (4 * np.pi * area) / (peri * peri)
 
             score = (
-                area * 0.25
-                + brilho * 0.40
-                + sat * 0.15
-                + circ * 15
-                - dist_center * 60 * prefer_center_weight
-                - dist_prev * 45
+                area * 0.25 +
+                brilho * 0.40 +
+                sat * 0.15 +
+                circ * 15 -
+                dist_center * 60 -
+                dist_prev * 45
             )
 
             if score > best_score:
                 best_score = score
                 melhor = {
                     "color": color_name,
-                    "area": float(area),
-                    "brightness": float(brilho),
-                    "saturation": float(sat),
-                    "score": float(score),
+                    "area": area,
+                    "brightness": brilho,
+                    "saturation": sat,
+                    "score": score,
                     "bbox": (x, y, bw, bh),
-                    "center_x": float(cx),
-                    "center_y": float(cy),
+                    "center_x": cx,
+                    "center_y": cy
                 }
 
     return melhor
