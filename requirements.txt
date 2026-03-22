@@ -6,3 +6,6 @@ qrcode
 streamlit-webrtc
 av
 opencv-python-headless
+opencv-python
+scikit-learn
+joblib
