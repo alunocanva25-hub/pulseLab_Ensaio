@@ -21,8 +21,9 @@ DEFAULTS = {
     "debounce_ms": 120,
     "limiar_on": 18.0,
     "limiar_off": 8.0,
+    "auto_calibrate": True,
+    "target_lock": True,
 }
-
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -43,6 +44,16 @@ with st.sidebar:
     st.session_state.fast_pulse_mode = st.toggle(
         "Modo pulso rápido",
         value=st.session_state.fast_pulse_mode,
+    )
+
+    st.session_state.auto_calibrate = st.toggle(
+        "Auto calibração",
+        value=st.session_state.auto_calibrate,
+    )
+
+    st.session_state.target_lock = st.toggle(
+        "Travar alvo",
+        value=st.session_state.target_lock,
     )
 
     st.session_state.limiar_on = st.number_input(
@@ -105,12 +116,14 @@ det_cfg = DetectorConfig(
     limiar_off=float(st.session_state.limiar_off),
     led_color_mode=str(st.session_state.led_color_mode),
     fast_pulse_mode=bool(st.session_state.fast_pulse_mode),
+    auto_calibrate=bool(st.session_state.auto_calibrate),
+    target_lock=bool(st.session_state.target_lock),
 )
 
 st.caption("Clique em START para abrir a câmera e testar o detector.")
 
 ctx = webrtc_streamer(
-    key="pulselab-detector-industrial",
+    key="pulselab-detector-industrial-v2",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=lambda: PulseDetectorProcessor(det_cfg),
     media_stream_constraints={"video": True, "audio": False},
@@ -136,6 +149,10 @@ if ctx and ctx.video_processor:
     c8.metric("IA confiança", snap["ai_confidence"])
     c9.metric("Alvo válido", "SIM" if snap["target_valid"] else "NÃO")
     c10.metric("Frequência (Hz)", snap["hz"])
+
+    c11, c12 = st.columns(2)
+    c11.metric("Limiar ON atual", snap["limiar_on"])
+    c12.metric("Limiar OFF atual", snap["limiar_off"])
 
     st.info(f"Motivo IA: {snap['ai_reason']}")
 else:
