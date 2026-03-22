@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-import numpy as np
 import math
+import numpy as np
 
 
 class LEDAIVerifier:
@@ -22,16 +22,12 @@ class LEDAIVerifier:
     def _stability(self, values):
         if len(values) < 4:
             return 0.5
-
-        arr = np.array(values)
+        arr = np.array(values, dtype=float)
         mean = np.mean(arr)
         std = np.std(arr)
-
         if mean <= 0:
             return 0.2
-
         ratio = std / mean
-
         if ratio < 0.10:
             return 0.95
         if ratio < 0.20:
@@ -45,12 +41,9 @@ class LEDAIVerifier:
     def _position_stability(self):
         if len(self.cx_history) < 4:
             return 0.5
-
-        xs = np.array(self.cx_history)
-        ys = np.array(self.cy_history)
-
+        xs = np.array(self.cx_history, dtype=float)
+        ys = np.array(self.cy_history, dtype=float)
         std_pos = math.sqrt(np.std(xs) ** 2 + np.std(ys) ** 2)
-
         if std_pos < 2:
             return 0.95
         if std_pos < 4:
@@ -95,13 +88,10 @@ class LEDAIVerifier:
 
         if color_ok:
             confidence += 0.35
-
         if area >= 4:
             confidence += 0.15
-
         if brightness >= 70:
             confidence += 0.15
-
         if score >= 5:
             confidence += 0.10
 
@@ -111,10 +101,8 @@ class LEDAIVerifier:
         confidence += brightness_stability * 0.03
         confidence += pos_stability * 0.03
 
-        is_valid = confidence >= 0.55
-
         return {
-            "is_valid_led": is_valid,
+            "is_valid_led": confidence >= 0.55,
             "confidence": round(min(confidence, 0.99), 2),
-            "reason": f"cor={color}, match={color_ok}, estabilidade={round(score_stability,2)}"
+            "reason": f"cor={color}, match={color_ok}, estabilidade={round(score_stability,2)}",
         }
