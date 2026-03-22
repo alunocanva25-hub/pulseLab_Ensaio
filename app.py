@@ -5,7 +5,11 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from detector.processor import DetectorConfig, PulseDetectorProcessor
 
-st.set_page_config(page_title="PulseLab Detector IA", page_icon="🔴", layout="wide")
+st.set_page_config(
+    page_title="PulseLab – Detector com IA Validadora",
+    page_icon="🔴",
+    layout="wide",
+)
 
 DEFAULTS = {
     "led_color_mode": "VERMELHO",
@@ -18,6 +22,7 @@ DEFAULTS = {
     "limiar_on": 18.0,
     "limiar_off": 8.0,
 }
+
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
