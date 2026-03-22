@@ -6,16 +6,16 @@ from collections import deque
 
 class ContadorPulso:
     def __init__(self, limiar_on=18, limiar_off=8, debounce_s=0.12):
-        self.limiar_on = limiar_on
-        self.limiar_off = limiar_off
-        self.debounce_s = debounce_s
+        self.limiar_on = float(limiar_on)
+        self.limiar_off = float(limiar_off)
+        self.debounce_s = float(debounce_s)
 
         self.estado = "OFF"
         self.pulsos = 0
-        self.ultimo_pulso = 0
+        self.ultimo_pulso = 0.0
 
         self.historico = deque(maxlen=10)
-        self.hz = 0
+        self.hz = 0.0
 
     def atualizar(self, score):
         agora = time.time()
