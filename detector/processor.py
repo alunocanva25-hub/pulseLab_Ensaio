@@ -47,7 +47,7 @@ class PulseDetectorProcessor:
             debounce_s=float(debounce_ms) / 1000.0,
         )
 
-        self.ai = LEDAIVerifier(history_size=10)
+        self.ai = LEDAIVerifier(history_size=20)
 
         self.score = 0.0
         self.pulsos = 0
@@ -59,6 +59,8 @@ class PulseDetectorProcessor:
         self.last_ai_confidence = 0.0
         self.last_ai_reason = "-"
         self.last_target_valid = False
+        self.last_hz = 0.0
+        self.prev_center = None
 
     def _calc_full_score(self, merged_mask):
         if merged_mask is None or merged_mask.size == 0:
@@ -80,7 +82,13 @@ class PulseDetectorProcessor:
         merged = merge_masks(color_masks)
         score_full = self._calc_full_score(merged)
 
-        target = analyze_best_target(hsv, color_masks)
+        target = analyze_best_target(
+            hsv,
+            color_masks,
+            prev_center=self.prev_center,
+            prefer_center_weight=1.0,
+        )
+
         ai_result = self.ai.validate(target, self.config.led_color_mode)
 
         with self.lock:
@@ -92,19 +100,21 @@ class PulseDetectorProcessor:
                 self.last_color = str(target["color"])
                 self.last_area = float(target["area"])
                 self.last_brilho = float(target["brightness"])
+                self.prev_center = (target["center_x"], target["center_y"])
             else:
                 self.last_color = "-"
                 self.last_area = 0.0
                 self.last_brilho = 0.0
+                self.prev_center = None
 
             if target is not None and ai_result["is_valid_led"]:
                 raw = score_full * 1.30
                 self.status = f"{self.last_color}"
             elif target is not None:
-                raw = score_full * 0.50
+                raw = score_full * 0.30
                 self.status = f"{self.last_color} DUVIDOSO"
             else:
-                raw = score_full * 0.15
+                raw = 0.0
                 self.status = "SEM LED"
 
             area_pixels = float(merged.sum() / 255.0) if merged is not None else 0.0
@@ -120,10 +130,11 @@ class PulseDetectorProcessor:
             score = (instant * 0.70 + smooth * 0.30) if self.config.fast_pulse_mode else smooth
             self.score = score
 
-            if self.config.detector_enabled:
-                estado, pulsos, pulso = self.contador.atualizar(score)
+            if self.config.detector_enabled and self.last_target_valid:
+                estado, pulsos, pulso, hz = self.contador.atualizar(score)
                 self.last_estado = estado
                 self.pulsos = pulsos
+                self.last_hz = hz
 
                 if pulso:
                     self.status = "PULSO DETECTADO"
@@ -145,10 +156,10 @@ class PulseDetectorProcessor:
 
             cv2.putText(
                 img,
-                f"{self.status} | P:{self.pulsos}",
+                f"{self.status} | P:{self.pulsos} | Hz:{self.last_hz}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.62,
                 (0, 255, 0),
                 2,
             )
@@ -168,4 +179,5 @@ class PulseDetectorProcessor:
                 "ai_confidence": round(self.last_ai_confidence, 2),
                 "ai_reason": self.last_ai_reason,
                 "target_valid": self.last_target_valid,
+                "hz": round(self.last_hz, 2),
             }
