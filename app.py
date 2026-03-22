@@ -24,6 +24,7 @@ DEFAULTS = {
     "auto_calibrate": True,
     "target_lock": True,
 }
+
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -123,7 +124,7 @@ det_cfg = DetectorConfig(
 st.caption("Clique em START para abrir a câmera e testar o detector.")
 
 ctx = webrtc_streamer(
-    key="pulselab-detector-industrial-v2",
+    key="pulselab-detector-industrial-v3",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=lambda: PulseDetectorProcessor(det_cfg),
     media_stream_constraints={"video": True, "audio": False},
@@ -150,10 +151,44 @@ if ctx and ctx.video_processor:
     c9.metric("Alvo válido", "SIM" if snap["target_valid"] else "NÃO")
     c10.metric("Frequência (Hz)", snap["hz"])
 
-    c11, c12 = st.columns(2)
-    c11.metric("Limiar ON atual", snap["limiar_on"])
-    c12.metric("Limiar OFF atual", snap["limiar_off"])
+    c11, c12, c13, c14 = st.columns(4)
+    c11.metric("Modelo", snap["model_label"])
+    c12.metric("Conf. modelo", snap["model_confidence"])
+    c13.metric("Limiar ON atual", snap["limiar_on"])
+    c14.metric("Limiar OFF atual", snap["limiar_off"])
 
     st.info(f"Motivo IA: {snap['ai_reason']}")
+
+    st.markdown("### Ensinar a IA")
+    b1, b2, b3 = st.columns(3)
+
+    with b1:
+        if st.button("Salvar amostra ON", use_container_width=True):
+            path = ctx.video_processor.save_current_sample("on")
+            if path:
+                st.success(f"Amostra salva: {path}")
+            else:
+                st.warning("Nenhuma ROI disponível para salvar.")
+
+    with b2:
+        if st.button("Salvar amostra OFF", use_container_width=True):
+            path = ctx.video_processor.save_current_sample("off")
+            if path:
+                st.success(f"Amostra salva: {path}")
+            else:
+                st.warning("Nenhuma ROI disponível para salvar.")
+
+    with b3:
+        if st.button("Salvar RUÍDO", use_container_width=True):
+            path = ctx.video_processor.save_current_sample("ruido")
+            if path:
+                st.success(f"Amostra salva: {path}")
+            else:
+                st.warning("Nenhuma ROI disponível para salvar.")
+
+    st.markdown("---")
+    st.markdown("### Como treinar o modelo")
+    st.code("python -m detector.train_model", language="bash")
+
 else:
     st.warning("Aguardando câmera.")
