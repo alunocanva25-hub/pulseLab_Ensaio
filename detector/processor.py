@@ -8,7 +8,11 @@ import av
 import cv2
 
 from detector.ai_validator import LEDAIVerifier
-from detector.color_detector import analyze_best_target, build_color_masks, merge_masks
+from detector.color_detector import (
+    analyze_best_target,
+    build_color_masks,
+    merge_masks,
+)
 from detector.pulse_counter import ContadorPulso
 
 
@@ -127,7 +131,11 @@ class PulseDetectorProcessor:
             self.buffer.append(raw)
             smooth = sum(self.buffer) / len(self.buffer)
 
-            score = (instant * 0.70 + smooth * 0.30) if self.config.fast_pulse_mode else smooth
+            if self.config.fast_pulse_mode:
+                score = (instant * 0.70) + (smooth * 0.30)
+            else:
+                score = smooth
+
             self.score = score
 
             if self.config.detector_enabled and self.last_target_valid:
