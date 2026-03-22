@@ -8,11 +8,7 @@ import av
 import cv2
 
 from detector.ai_validator import LEDAIVerifier
-from detector.color_detector import (
-    analyze_best_target,
-    build_color_masks,
-    merge_masks,
-)
+from detector.color_detector import analyze_best_target, build_color_masks, merge_masks
 from detector.pulse_counter import ContadorPulso
 
 
@@ -27,6 +23,8 @@ class DetectorConfig:
     limiar_off: float = 8.0
     led_color_mode: str = "VERMELHO"
     fast_pulse_mode: bool = True
+    auto_calibrate: bool = True
+    target_lock: bool = True
 
 
 class PulseDetectorProcessor:
@@ -40,6 +38,7 @@ class PulseDetectorProcessor:
 
         self.buffer = deque(maxlen=smooth_len)
         self.instant_buffer = deque(maxlen=2)
+        self.score_hist = deque(maxlen=20)
 
         debounce_ms = int(config.debounce_ms)
         if config.fast_pulse_mode:
@@ -65,11 +64,30 @@ class PulseDetectorProcessor:
         self.last_target_valid = False
         self.last_hz = 0.0
         self.prev_center = None
+        self.current_limiar_on = float(config.limiar_on)
+        self.current_limiar_off = float(config.limiar_off)
 
     def _calc_full_score(self, merged_mask):
         if merged_mask is None or merged_mask.size == 0:
             return 0.0
         return float((merged_mask.sum() / (merged_mask.size * 255.0)) * 100.0)
+
+    def _auto_thresholds(self):
+        if len(self.score_hist) < 8:
+            return self.current_limiar_on, self.current_limiar_off
+
+        vals = list(self.score_hist)
+        smin = min(vals)
+        smax = max(vals)
+        amp = max(smax - smin, 1.0)
+
+        off = smin + amp * 0.20
+        on = smin + amp * 0.55
+
+        if on <= off:
+            on = off + 1.0
+
+        return round(on, 2), round(off, 2)
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -82,6 +100,8 @@ class PulseDetectorProcessor:
         roi = img[y:y + size, x:x + size]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
+        prev_center = self.prev_center if self.config.target_lock else None
+
         color_masks = build_color_masks(hsv, self.config.led_color_mode)
         merged = merge_masks(color_masks)
         score_full = self._calc_full_score(merged)
@@ -89,7 +109,7 @@ class PulseDetectorProcessor:
         target = analyze_best_target(
             hsv,
             color_masks,
-            prev_center=self.prev_center,
+            prev_center=prev_center,
             prefer_center_weight=1.0,
         )
 
@@ -131,12 +151,14 @@ class PulseDetectorProcessor:
             self.buffer.append(raw)
             smooth = sum(self.buffer) / len(self.buffer)
 
-            if self.config.fast_pulse_mode:
-                score = (instant * 0.70) + (smooth * 0.30)
-            else:
-                score = smooth
-
+            score = (instant * 0.70 + smooth * 0.30) if self.config.fast_pulse_mode else smooth
             self.score = score
+            self.score_hist.append(score)
+
+            if self.config.auto_calibrate:
+                self.current_limiar_on, self.current_limiar_off = self._auto_thresholds()
+                self.contador.limiar_on = self.current_limiar_on
+                self.contador.limiar_off = self.current_limiar_off
 
             if self.config.detector_enabled and self.last_target_valid:
                 estado, pulsos, pulso, hz = self.contador.atualizar(score)
@@ -188,4 +210,6 @@ class PulseDetectorProcessor:
                 "ai_reason": self.last_ai_reason,
                 "target_valid": self.last_target_valid,
                 "hz": round(self.last_hz, 2),
+                "limiar_on": round(self.current_limiar_on, 2),
+                "limiar_off": round(self.current_limiar_off, 2),
             }
