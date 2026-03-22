@@ -1,55 +1,81 @@
-from __future__ import annotations
-
 from collections import deque
 import numpy as np
 
 
 class LEDAIVerifier:
-    def __init__(self, history_size: int = 10):
-        self.score_history = deque(maxlen=max(4, int(history_size)))
+    def __init__(self, history_size=10):
+        self.score_history = deque(maxlen=history_size)
+        self.color_history = deque(maxlen=5)
 
-    def update(self, score: float):
-        self.score_history.append(float(score))
+    def _color_match(self, target_color, selected_color):
+        if selected_color == "AUTOMÁTICO":
+            return True
+        return target_color == selected_color
 
-    def validate(self, target: dict | None):
+    def validate(self, target, selected_color):
         if target is None:
             return {
                 "is_valid_led": False,
-                "confidence": 0.10,
-                "reason": "Nenhum alvo encontrado",
+                "confidence": 0.0,
+                "reason": "Nenhum alvo"
             }
 
-        score = float(target.get("score", 0.0))
-        area = float(target.get("area", 0.0))
-        brightness = float(target.get("brightness", 0.0))
+        score = float(target.get("score", 0))
+        area = float(target.get("area", 0))
+        brilho = float(target.get("brightness", 0))
+        cor = target.get("color", "N/A")
 
-        self.update(score)
+        self.score_history.append(score)
+        self.color_history.append(cor)
 
+        # =========================
+        # 1. VALIDA COR SELECIONADA
+        # =========================
+        color_ok = self._color_match(cor, selected_color)
+
+        # =========================
+        # 2. CONSISTÊNCIA TEMPORAL
+        # =========================
+        consistency = self.color_history.count(cor) / len(self.color_history)
+
+        # =========================
+        # 3. ESTABILIDADE DO SCORE
+        # =========================
         stability = 0.5
         if len(self.score_history) >= 4:
-            arr = np.array(self.score_history, dtype=float)
-            mean_val = float(np.mean(arr))
-            std_val = float(np.std(arr))
-            ratio = std_val / max(mean_val, 1e-6) if mean_val > 0 else 1.0
+            arr = np.array(self.score_history)
+            std = np.std(arr)
+            mean = np.mean(arr)
+            if mean > 0:
+                ratio = std / mean
+                if ratio < 0.2:
+                    stability = 0.9
+                elif ratio < 0.4:
+                    stability = 0.6
+                else:
+                    stability = 0.3
 
-            if ratio < 0.20:
-                stability = 0.9
-            elif ratio < 0.40:
-                stability = 0.6
-            else:
-                stability = 0.3
-
+        # =========================
+        # SCORE FINAL
+        # =========================
         confidence = 0.0
-        if area >= 4:
-            confidence += 0.25
-        if brightness >= 70:
-            confidence += 0.25
-        confidence += 0.25 * stability
-        if score >= 5:
-            confidence += 0.15
+
+        if color_ok:
+            confidence += 0.4
+
+        if area > 5:
+            confidence += 0.2
+
+        if brilho > 80:
+            confidence += 0.2
+
+        confidence += consistency * 0.2
+        confidence *= stability
+
+        is_valid = confidence > 0.5
 
         return {
-            "is_valid_led": confidence >= 0.45,
-            "confidence": round(min(confidence, 0.99), 2),
-            "reason": f"score={round(score,2)}, area={round(area,2)}, brilho={round(brightness,2)}, estabilidade={round(stability,2)}",
+            "is_valid_led": is_valid,
+            "confidence": round(confidence, 2),
+            "reason": f"cor={cor}, match={color_ok}, consist={round(consistency,2)}"
         }
