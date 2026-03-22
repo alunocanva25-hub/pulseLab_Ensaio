@@ -132,9 +132,11 @@ class PulseDetectorProcessor:
 
         if self.config.show_overlay:
             cv2.rectangle(img, (x, y), (x + size, y + size), (0, 255, 255), 2)
+
             if target is not None and target.get("bbox"):
                 tx, ty, tw, th = target["bbox"]
                 cv2.rectangle(img, (x + tx, y + ty), (x + tx + tw, y + ty + th), (255, 200, 0), 2)
+
             cv2.putText(
                 img,
                 f"{self.status} | P:{self.pulsos}",
