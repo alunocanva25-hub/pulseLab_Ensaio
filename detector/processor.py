@@ -135,7 +135,13 @@ class PulseDetectorProcessor:
 
             if target is not None and target.get("bbox"):
                 tx, ty, tw, th = target["bbox"]
-                cv2.rectangle(img, (x + tx, y + ty), (x + tx + tw, y + ty + th), (255, 200, 0), 2)
+                cv2.rectangle(
+                    img,
+                    (x + tx, y + ty),
+                    (x + tx + tw, y + ty + th),
+                    (255, 200, 0),
+                    2,
+                )
 
             cv2.putText(
                 img,
