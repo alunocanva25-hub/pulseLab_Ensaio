@@ -10,39 +10,33 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
+from detector.temporal_features import frame_features, sequence_features
+
 DATASET_DIR = Path("dataset_led")
 META_FILE = DATASET_DIR / "metadata.jsonl"
 MODEL_FILE = Path("detector_model.joblib")
 
 
-def extract_features(img_bgr):
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-    h_mean = float(np.mean(hsv[:, :, 0]))
-    s_mean = float(np.mean(hsv[:, :, 1]))
-    v_mean = float(np.mean(hsv[:, :, 2]))
-
-    h_std = float(np.std(hsv[:, :, 0]))
-    s_std = float(np.std(hsv[:, :, 1]))
-    v_std = float(np.std(hsv[:, :, 2]))
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray_mean = float(np.mean(gray))
-    gray_std = float(np.std(gray))
-    bright_ratio = float(np.mean(gray > 200))
-
-    b, g, r = cv2.split(img_bgr)
-    red_score = float(
-        np.mean(r.astype(np.float32) - ((g.astype(np.float32) + b.astype(np.float32)) / 2.0))
-    )
-
-    return [
-        h_mean, s_mean, v_mean,
-        h_std, s_std, v_std,
-        gray_mean, gray_std,
-        bright_ratio,
-        red_score,
+def extract_features(img_bgr, sequence_imgs=None):
+    base = frame_features(img_bgr)
+    base_vec = [
+        base["h_mean"], base["s_mean"], base["v_mean"],
+        base["h_std"], base["s_std"], base["v_std"],
+        base["gray_mean"], base["gray_std"],
+        base["bright_ratio"], base["red_score"],
     ]
+
+    seq_vec = sequence_features(sequence_imgs or [img_bgr])
+    return base_vec + seq_vec
+
+
+def load_sequence(paths):
+    frames = []
+    for p in paths:
+        img = cv2.imread(str(p))
+        if img is not None:
+            frames.append(img)
+    return frames
 
 
 def load_dataset():
@@ -57,6 +51,7 @@ def load_dataset():
             row = json.loads(line)
             img_path = Path(row["file"])
             label = row["label"]
+            seq_paths = row.get("sequence_files", [])
 
             if not img_path.exists():
                 continue
@@ -65,7 +60,9 @@ def load_dataset():
             if img is None:
                 continue
 
-            feats = extract_features(img)
+            seq_imgs = load_sequence(seq_paths)
+            feats = extract_features(img, seq_imgs)
+
             X.append(feats)
             y.append(label)
 
@@ -83,8 +80,8 @@ def train():
     )
 
     model = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=10,
+        n_estimators=300,
+        max_depth=12,
         random_state=42,
     )
     model.fit(X_train, y_train)
