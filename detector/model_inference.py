@@ -20,7 +20,7 @@ class DetectorModel:
     def is_loaded(self) -> bool:
         return self.model is not None
 
-    def predict(self, roi_bgr):
+    def predict(self, roi_bgr, sequence_imgs=None):
         if self.model is None:
             return {
                 "loaded": False,
@@ -28,7 +28,7 @@ class DetectorModel:
                 "confidence": 0.0,
             }
 
-        feats = np.array([extract_features(roi_bgr)], dtype=np.float32)
+        feats = np.array([extract_features(roi_bgr, sequence_imgs)], dtype=np.float32)
         probs = self.model.predict_proba(feats)[0]
         labels = self.model.classes_
 
