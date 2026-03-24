@@ -41,6 +41,7 @@ class PulseDetectorProcessor:
         self.buffer = deque(maxlen=smooth_len)
         self.instant_buffer = deque(maxlen=2)
         self.score_hist = deque(maxlen=20)
+        self.roi_sequence = deque(maxlen=12)
 
         debounce_ms = int(config.debounce_ms)
         if config.fast_pulse_mode:
@@ -108,7 +109,12 @@ class PulseDetectorProcessor:
             "model_conf": round(self.last_model_conf, 4),
             "ai_conf": round(self.last_ai_confidence, 4),
         }
-        return save_sample(self.last_roi_bgr, label, meta)
+        return save_sample(
+            self.last_roi_bgr,
+            label,
+            meta,
+            sequence=list(self.roi_sequence),
+        )
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -120,6 +126,7 @@ class PulseDetectorProcessor:
 
         roi = img[y:y + size, x:x + size].copy()
         self.last_roi_bgr = roi.copy()
+        self.roi_sequence.append(roi.copy())
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
@@ -137,7 +144,7 @@ class PulseDetectorProcessor:
         )
 
         ai_result = self.ai.validate(target, self.config.led_color_mode)
-        model_result = self.model.predict(roi)
+        model_result = self.model.predict(roi, list(self.roi_sequence))
 
         with self.lock:
             self.last_model_label = model_result["label"]
